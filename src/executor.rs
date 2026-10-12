@@ -12,9 +12,7 @@ impl VanguardExecutor {
         }
 
         let py_cmd = if cfg!(target_os = "windows") { "python" } else { "python3" };
-        let output_result = Command::new(py_cmd).arg(&target_file).output();
-
-        match output_result {
+        match Command::new(py_cmd).arg(&target_file).output() {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);

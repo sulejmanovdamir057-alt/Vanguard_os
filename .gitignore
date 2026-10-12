@@ -1,1 +1,23 @@
 /target
+
+# Артефакты, которые приложение пишет в корень репозитория при работе
+# (см. раздел про runtime side effects в AGENTS.md). Ни один из них не является
+# исходником: скрипты генерирует ИИ, .exe/.pdb — rustc, .rs/.bat/.sh — временные.
+# Без этих паттернов git status забивается мусором после каждого cargo run и /run.
+vanguard_gen_*.py
+vanguard_tmp_*.rs
+vanguard_app_*.exe
+vanguard_app_*.pdb
+vanguard_script_*.bat
+vanguard_script_*.sh
+
+# Заметки блокнота: приложение пишет их сюда при каждом изменении текста.
+vanguard_notes.txt
+
+# Кэш Python, который оставляет src/optimize_project.py при запуске.
+__pycache__/
+
+# Побочные продукты СТАРОЙ версии src/optimize_project.py (см. AGENTS.md): нынешняя
+# версия бэкапит во временной папке и таких файлов не оставляет, но старые могут
+# лежать в дереве с прошлых запусков.
+*.rs.bak

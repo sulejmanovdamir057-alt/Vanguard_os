@@ -27,17 +27,11 @@ pub fn spawn_telemetry_daemon(metrics_container: Arc<Mutex<SystemMetrics>>) {
         let mut sys = System::new_all();
         let mut disks = Disks::new_with_refreshed_list();
         loop {
-            sys.refresh_cpu_usage();
+            sys.refresh_cpu();
             sys.refresh_memory();
             disks.refresh_list();
 
-            let cpus = sys.cpus();
-            let cpu_load = if !cpus.is_empty() {
-                let total_cpu: f32 = cpus.iter().map(|cpu| cpu.cpu_usage()).sum();
-                total_cpu / cpus.len() as f32
-            } else {
-                0.0
-            };
+            let cpu_load = sys.global_cpu_info().cpu_usage();
 
             let total_ram = sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
             let used_ram = sys.used_memory() as f64 / 1024.0 / 1024.0 / 1024.0;

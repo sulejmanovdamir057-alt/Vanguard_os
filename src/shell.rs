@@ -1,26 +1,68 @@
 use std::fs::{self, File};
 use std::io::Write;
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc::Sender, Arc};
 use std::thread;
-use glob::glob;
-use regex::Regex;
 use rand::Rng;
 use sysinfo::System;
+use glob::glob;
+use regex::Regex;
 
+// Действия и события ИИ приходят из ядра (ai_core) — там же протокол VanguardAction.
+use crate::ai_core::{AiEvent, VanguardAction};
 use crate::executor::VanguardExecutor;
 
+/// Сколько сообщений уходит в запрос. Это 12 реплик: замерено на этой машине, что 10 реплик
+/// поднимают prompt_tokens с ~309 до ~1169 и стоят +0.4 с пребилда, дальше контекст дешёвым
+/// уже не бывает, а для 9b-модели и этого окна хватает.
+const MAX_HISTORY_MESSAGES: usize = 24;
+
+/// Имя файла `vanguard_gen_553.py` -> Some("553"), всё остальное -> None.
+/// Префикс `vanguard_gen_` — 13 байт, расширение `.py` — 3. Один разбор на все
+/// места, где показывается ID: `/apps` в шелле и окна Лаунчера/Проводника в app.rs.
+pub(crate) fn script_id_from_path(path: &str) -> Option<String> {
+    let name = std::path::Path::new(path).file_name()?.to_string_lossy().into_owned();
+    if name.len() > 16 { Some(name[13..name.len() - 3].to_string()) } else { None }
+}
+
 pub struct VanguardAI {
-    pub history: String,
+    /// Диалог, который уходит в каждый запрос: пары (role, content).
+    /// Раньше этого поля не было вовсе — запрос состоял из [system, user], и модель
+    /// не помнила предыдущих реплик.
+    pub messages: Vec<(String, String)>,
 }
 
 impl VanguardAI {
     pub fn new() -> Self {
-        Self { history: String::from("System: Инициализирован встроенный ИИ-терминал.\n") }
+        Self { messages: Vec::new() }
     }
     pub fn clear_memory(&mut self) {
-        self.history = String::from("System: Инициализирован встроенный ИИ-терминал.\n");
+        // Сбрасываем диалог — на это завязаны /reset и Ctrl+L в app.rs
+        self.messages.clear();
     }
+
+    /// Реплика пользователя. Запоминается до отправки, чтобы модель увидела её в запросе.
+    pub fn push_user(&mut self, text: &str) {
+        self.messages.push(("user".to_string(), text.to_string()));
+        self.trim_history();
+    }
+
+    /// Ответ модели. Без неё история состояла бы из одних вопросов, и модель не помнила бы,
+    /// что сама ответила.
+    pub fn push_assistant(&mut self, text: &str) {
+        self.messages.push(("assistant".to_string(), text.to_string()));
+        self.trim_history();
+    }
+
+    fn trim_history(&mut self) {
+        let excess = self.messages.len().saturating_sub(MAX_HISTORY_MESSAGES);
+        if excess > 0 {
+            self.messages.drain(..excess);
+        }
+    }
+
     pub fn save_code_if_exists(&mut self, full_text: &str) -> Option<String> {
-        self.history.push_str(&format!("{}\n", full_text));
         let re = Regex::new(r"(?s)```python\n(.*?)\n```").unwrap();
 
         if let Some(captures) = re.captures(full_text) {
@@ -48,11 +90,21 @@ pub enum ShellAction {
 
 pub struct VanguardShell {
     pub ai_core: VanguardAI,
+    // Логи фоновых задач (/run) уходят через этот канал прямо в GUI-чат,
+    // минуя консоль. None — печатаем в stdout как раньше.
+    pub log_tx: Option<Sender<AiEvent>>,
+    // Счётчик незавершённых фоновых задач: UI держит кадр живым, пока он > 0,
+    // иначе egui уснёт и лог задачи не дорисуется.
+    pub bg_tasks: Arc<AtomicUsize>,
 }
 
 impl VanguardShell {
     pub fn new() -> Self {
-        Self { ai_core: VanguardAI::new() }
+        Self {
+            ai_core: VanguardAI::new(),
+            log_tx: None,
+            bg_tasks: Arc::new(AtomicUsize::new(0)),
+        }
     }
     pub fn handle_command(&mut self, query: &str) -> ShellAction {
         let trimmed = query.trim();
@@ -89,9 +141,17 @@ impl VanguardShell {
                 }
                 let file_id = parts[1..].join(" ");
                 let file_id_clone = file_id.clone();
+                let log_tx = self.log_tx.clone();
+                let bg_tasks = Arc::clone(&self.bg_tasks);
+                bg_tasks.fetch_add(1, Ordering::SeqCst);
                 thread::spawn(move || {
                     let execution_log = VanguardExecutor::execute_script(&file_id_clone);
-                    println!("\n{}\n", execution_log);
+                    let payload = format!("\n{}\n", execution_log);
+                    match log_tx {
+                        Some(tx) => { let _ = tx.send(AiEvent::Token(payload)); }
+                        None => println!("{}", payload),
+                    }
+                    bg_tasks.fetch_sub(1, Ordering::SeqCst);
                 });
                 ShellAction::DisplayOutput(format!(">> INITIATING BACKGROUND TASK FOR APP ID: {}...\n", file_id))
             }
@@ -103,7 +163,7 @@ impl VanguardShell {
                         found = true;
                         let file_size = fs::metadata(&entry).map(|m| m.len() as f64 / 1024.0).unwrap_or(0.0);
                         let file_name = entry.to_string_lossy();
-                        let id = if file_name.len() > 16 { &file_name[13..file_name.len() - 3] } else { "???" };
+                        let id = script_id_from_path(&file_name).unwrap_or_else(|| "???".to_string());
                         log.push_str(&format!("-> [ID: {}] | FILE: {} | SIZE: {:.2} KB\n", id, file_name, file_size));
                     }
                 }
@@ -122,6 +182,82 @@ impl VanguardShell {
                     ShellAction::DisplayOutput(format!(">> vsh: command not found: {}\n", cmd_lower))
                 } else {
                     ShellAction::AiStreamAllowed
+                }
+            }
+        }
+    }
+
+    pub fn execute_ai_action(&mut self, action: VanguardAction) -> String {
+        match action {
+            VanguardAction::TextResponse { text } => {
+                format!("V: {}\n", text)
+            }
+            VanguardAction::SystemCommand { command } => {
+                format!(">> ИИ инициировал системную команду: /{}.\n", command)
+            }
+            VanguardAction::CreateScript { language, code, description } => {
+                let gen_id = rand::thread_rng().gen_range(100..1000);
+                match language.to_lowercase().as_str() {
+                    "python" => {
+                        let filename = format!("vanguard_gen_{}.py", gen_id);
+                        // Без unwrap: execute_ai_action зовётся из check_ai_stream прямо в
+                        // UI-потоке, и паника здесь убила бы всё приложение целиком.
+                        if let Err(e) = fs::write(&filename, &code) {
+                            return format!(">> [ИИ] {}\n>> ОШИБКА ЗАПИСИ {}: {}\n", description, filename, e);
+                        }
+                        format!(">> [ИИ] {}\n>> Создан Python-скрипт ID: {}. Запуск через /run {}\n", description, gen_id, gen_id)
+                    }
+                    "rust" => {
+                        let source_file = format!("vanguard_tmp_{}.rs", gen_id);
+                        let binary_file = format!("vanguard_app_{}.exe", gen_id);
+                        if let Err(e) = fs::write(&source_file, &code) {
+                            return format!(">> [ИИ] {}\n>> ОШИБКА ЗАПИСИ исходника {}: {}\n", description, source_file, e);
+                        }
+
+                        // .output(), а не .status(): первый наследует stderr в консоль, а консоли
+                        // у GUI-приложения нет — rustc писал бы точную причину туда, где её
+                        // никто не увидит. Ловим stderr и кладём в чат, иначе сбой
+                        // компиляции полностью не диагностируется.
+                        let output = Command::new("rustc")
+                            .args(["-O", &source_file, "-o", &binary_file])
+                            .output();
+
+                        match output {
+                            Ok(out) if out.status.success() => {
+                                let _ = fs::remove_file(&source_file);
+                                format!(">> [ИИ] {}\n>> УСПЕШНАЯ КОМПИЛЯЦИЯ ЯДРА!\n>> Бинарник готов: {}.\n", description, binary_file)
+                            }
+                            Ok(out) => {
+                                // Исходник при сбое НЕ удаляем: он и есть артефакт для разбора.
+                                // Плюс хвост stderr rustc — первые строки обычно содержат саму
+                                // ошибку, дальше идут подсказки компилятора.
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                let head: Vec<&str> = stderr.lines().take(14).collect();
+                                format!(
+                                    ">> СБОЙ КОМПИЛЯЦИИ RUST-МОДУЛЯ ИИ (rustc exit {}).\n>> Исходник сохранён для разбора: {}\n{}\n",
+                                    out.status.code().unwrap_or(-1),
+                                    source_file,
+                                    head.join("\n")
+                                )
+                            }
+                            Err(e) => {
+                                let _ = fs::remove_file(&source_file);
+                                format!(">> СБОЙ КОМПИЛЯЦИИ: rustc не запустился: {}.\n", e)
+                            }
+                        }
+                    }
+                    "bash" | "sh" | "cmd" => {
+                        let ext = if cfg!(target_os = "windows") { "bat" } else { "sh" };
+                        let filename = format!("vanguard_script_{}.{}", gen_id, ext);
+                        if let Err(e) = fs::write(&filename, &code) {
+                            return format!(">> [ИИ] {}\n>> ОШИБКА ЗАПИСИ {}: {}\n", description, filename, e);
+                        }
+                        #[cfg(unix)] {
+                            let _ = Command::new("chmod").args(&["+x", &filename]).status();
+                        }
+                        format!(">> [ИИ] {}\n>> Создан сценарий автоматизации: {}.\n", description, filename)
+                    }
+                    _ => format!(">> Ошибка: Язык [ {} ] не поддерживается ядром.\n", language)
                 }
             }
         }
