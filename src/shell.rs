@@ -18,6 +18,40 @@ use crate::executor::VanguardExecutor;
 /// уже не бывает, а для 9b-модели и этого окна хватает.
 const MAX_HISTORY_MESSAGES: usize = 24;
 
+/// Журнал диалогов для самообучения: каждая реплика дописывается сюда одной
+/// JSON-строкой, а скрипт `trainer/vanguard_train.py` читает файл и дообучает
+/// адаптер LoRA на собственных ответах модели. Best-effort запись: ошибка диска
+/// не должна ронять диолог — обучение просто увидит меньше данных.
+pub const DIALOGUE_LOG: &str = "vanguard_dialogues.jsonl";
+
+/// Дописывает реплику в журнал диалогов (JSONL). Роль + текст + unix-время.
+fn log_dialogue_line(role: &str, text: &str) {
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // serde_json экранирует кавычки и переводы строк — руками ничего не надо.
+    let line = serde_json::json!({ "role": role, "content": text, "ts": ts });
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(DIALOGUE_LOG)
+    {
+        let _ = writeln!(f, "{}", line);
+    }
+}
+
+/// Сколько реплик лежит в журнале — статистика для окна Neural Trainer.
+/// `lines()` считает и пустые, и битые строки: для счётчика это не важно.
+pub fn count_dialogue_lines() -> usize {
+    use std::io::{BufRead, BufReader};
+    match std::fs::File::open(DIALOGUE_LOG) {
+        Ok(f) => BufReader::new(f).lines().count(),
+        Err(_) => 0,
+    }
+}
+
 /// Имя файла `vanguard_gen_553.py` -> Some("553"), всё остальное -> None.
 /// Префикс `vanguard_gen_` — 13 байт, расширение `.py` — 3. Один разбор на все
 /// места, где показывается ID: `/apps` в шелле и окна Лаунчера/Проводника в app.rs.
@@ -44,6 +78,7 @@ impl VanguardAI {
 
     /// Реплика пользователя. Запоминается до отправки, чтобы модель увидела её в запросе.
     pub fn push_user(&mut self, text: &str) {
+        log_dialogue_line("user", text);
         self.messages.push(("user".to_string(), text.to_string()));
         self.trim_history();
     }
@@ -51,6 +86,7 @@ impl VanguardAI {
     /// Ответ модели. Без неё история состояла бы из одних вопросов, и модель не помнила бы,
     /// что сама ответила.
     pub fn push_assistant(&mut self, text: &str) {
+        log_dialogue_line("assistant", text);
         self.messages.push(("assistant".to_string(), text.to_string()));
         self.trim_history();
     }

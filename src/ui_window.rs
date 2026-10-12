@@ -79,17 +79,19 @@ pub enum WindowId {
     Cleaner,
     Apps,
     Scripts,
+    Trainer,
 }
 
 impl WindowId {
     /// Порядок здесь задаёт порядок кнопок на панели задач.
     /// Добавляете окно — дописываете вариант сюда, и оно сразу появится в панели.
-    pub const ALL: [WindowId; 5] = [
+    pub const ALL: [WindowId; 6] = [
         WindowId::Notes,
         WindowId::Matrix,
         WindowId::Cleaner,
         WindowId::Apps,
         WindowId::Scripts,
+        WindowId::Trainer,
     ];
 }
 
@@ -101,6 +103,7 @@ pub struct VanguardWindows {
     pub cleaner: VanguardWindow,
     pub apps: VanguardWindow,
     pub scripts: VanguardWindow,
+    pub trainer: VanguardWindow,
 }
 
 impl VanguardWindows {
@@ -111,6 +114,7 @@ impl VanguardWindows {
             cleaner: VanguardWindow::new("Core Cleaner v1.1", 400.0, 250.0),
             apps: VanguardWindow::new("Vanguard App Registry", 450.0, 300.0),
             scripts: VanguardWindow::new("Script Explorer", 620.0, 420.0),
+            trainer: VanguardWindow::new("Neural Trainer v0.1", 420.0, 340.0),
         }
     }
 
@@ -130,6 +134,7 @@ impl VanguardWindows {
             WindowId::Cleaner => &mut self.cleaner,
             WindowId::Apps => &mut self.apps,
             WindowId::Scripts => &mut self.scripts,
+            WindowId::Trainer => &mut self.trainer,
         }
     }
 
@@ -142,6 +147,7 @@ impl VanguardWindows {
             WindowId::Cleaner => &self.cleaner,
             WindowId::Apps => &self.apps,
             WindowId::Scripts => &self.scripts,
+            WindowId::Trainer => &self.trainer,
         }
     }
 }

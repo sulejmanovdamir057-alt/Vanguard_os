@@ -588,6 +588,11 @@ fn default_icons() -> Vec<DesktopIcon> {
             hint: "Проводник скриптов",
             action: IconAction::OpenWindow(WindowId::Scripts),
         },
+        DesktopIcon {
+            label: "🧬 TRAINER",
+            hint: "Самообучение модели (QLoRA)",
+            action: IconAction::OpenWindow(WindowId::Trainer),
+        },
     ]
 }
 

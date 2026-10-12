@@ -93,6 +93,12 @@ pub struct VanguardOSApp {
     explorer_sel: Option<String>,
     explorer_code: String,
     explorer_status: String,
+    // 🧬 Самообучение (окно Neural Trainer): HF-модель для дообучения, счётчик
+    // реплик в журнале диалогов, текстовый статус и флаг «тренировка идёт».
+    trainer_hf_model: String,
+    trainer_count: usize,
+    trainer_status: String,
+    trainer_running: Arc<AtomicBool>,
     /// Рабочий стол: раскладка иконок, контекстное меню и прочее собственное
     /// состояние. Всё, что рисуется на CentralPanel после заставки, живёт в desktop.rs.
     desktop: Desktop,
@@ -144,6 +150,14 @@ impl VanguardOSApp {
             explorer_sel: None,
             explorer_code: String::new(),
             explorer_status: String::from("Выберите скрипт из списка слева."),
+            // 🧬 Самообучение: модель по умолчанию — та же, что в Ollama, но в
+            // формате HuggingFace; переопределяется env VANGUARD_TRAIN_HF_MODEL
+            // или полем в окне Trainer.
+            trainer_hf_model: std::env::var("VANGUARD_TRAIN_HF_MODEL")
+                .unwrap_or_else(|_| String::from("Qwen/Qwen3.5-9B")),
+            trainer_count: crate::shell::count_dialogue_lines(),
+            trainer_status: String::from("Готов к тренировке."),
+            trainer_running: Arc::new(AtomicBool::new(false)),
             desktop: Desktop::new(),
             backend_alive: Arc::new(AtomicBool::new(false)),
             ai_model_name: configured_model(),
@@ -444,6 +458,113 @@ impl VanguardOSApp {
         });
     }
 
+    /// 🧬 Окно Neural Trainer: HF-модель, статистика журнала диалогов, кнопка старта.
+    /// Подробный лог обучения идёт в GUI-чат (как у /run) — в окне только статус,
+    /// чтобы не дублировать поток и не спорить с маркером стриминга.
+    fn draw_trainer_window(&mut self, ctx: &egui::Context) {
+        // Флаги вместо прямых вызовов: замыкание показа занято borrow'ом
+        // self.windows.trainer, а start_trainer берёт &mut self целиком.
+        let mut want_start = false;
+        let mut want_refresh = false;
+        self.windows.trainer.show(ctx, |ui| {
+            ui.heading(">> SELF-FINETUNE PROTOCOL (QLoRA)");
+            ui.add_space(6.0);
+
+            ui.label("HuggingFace-модель для дообучения:");
+            ui.add(egui::TextEdit::singleline(&mut self.trainer_hf_model).desired_width(320.0));
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label(format!("Реплик в журнале диалогов: {}", self.trainer_count));
+                if ui.button("⟳ пересчитать").clicked() {
+                    want_refresh = true;
+                }
+            });
+            ui.add_space(6.0);
+
+            let running = self.trainer_running.load(Ordering::SeqCst);
+            let btn = ui.add_enabled(!running, egui::Button::new("▶ ЗАПУСТИТЬ ДООБУЧЕНИЕ"));
+            if btn.clicked() {
+                want_start = true;
+            }
+            if running {
+                ui.add(egui::Spinner::new());
+            }
+
+            ui.add_space(6.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 220, 120),
+                egui::RichText::new(self.trainer_status.as_str()).monospace().small(),
+            );
+            ui.add_space(6.0);
+            ui.small("Дообучение идёт на Ваших собственных диалогах из терминала.\nБаза не изменяется: адаптеры копятся в trainer/runs/.");
+        });
+        if want_refresh {
+            self.trainer_count = crate::shell::count_dialogue_lines();
+        }
+        if want_start {
+            self.start_trainer();
+        }
+    }
+
+    /// 🧬 Запуск самообучения: python trainer/vanguard_train.py в фоновом потоке.
+    /// Построчный лог уходит в GUI-чат через log_tx (та же механика, что у /run),
+    /// счётчик bg_tasks держит панель задач и принудительную перерисовку живыми,
+    /// а trainer_running не пускает второй параллельный запуск.
+    fn start_trainer(&mut self) {
+        if self.trainer_running.load(Ordering::SeqCst) {
+            self.trainer_status = String::from("Тренировка уже идёт — дождитесь конца.");
+            return;
+        }
+        if self.is_ai_streaming {
+            // Обучение выгрузит модель из Ollama ради VRAM — текущий ответ ИИ
+            // должно пройти до начала, иначе он упадёт посередине.
+            self.trainer_status = String::from("Дождитесь готовности текущего ответа ИИ.");
+            return;
+        }
+        self.trainer_running.store(true, Ordering::SeqCst);
+        self.shell.bg_tasks.fetch_add(1, Ordering::SeqCst);
+        self.trainer_status = format!("Запуск {}… лог — в чате.", self.trainer_hf_model);
+
+        let hf = self.trainer_hf_model.clone();
+        let running = Arc::clone(&self.trainer_running);
+        let bg = Arc::clone(&self.shell.bg_tasks);
+        let tx = self.ai_event_tx.clone();
+        std::thread::spawn(move || {
+            let send = |text: String| {
+                let _ = tx.send(AiEvent::Token(text));
+            };
+            send(String::from(">> TRAINER: запуск python trainer/vanguard_train.py\n"));
+            let child = std::process::Command::new("python")
+                .args(["trainer/vanguard_train.py", "--hf-model", &hf])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            match child {
+                Ok(mut child) => {
+                    // stdout построчно прямо во время обучения; stderr добираем
+                    // по завершении — он короткий (ошибки загрузки модели и т.п.).
+                    if let Some(out) = child.stdout.take() {
+                        use std::io::{BufRead, BufReader};
+                        for line in BufReader::new(out).lines().map_while(Result::ok) {
+                            send(format!("T: {}\n", line));
+                        }
+                    }
+                    let err = child
+                        .wait_with_output()
+                        .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                        .unwrap_or_default();
+                    if !err.is_empty() {
+                        send(format!("T: [stderr] {}\n", err));
+                    }
+                }
+                Err(e) => send(format!("T: не удалось запустить python: {}\n", e)),
+            }
+            running.store(false, Ordering::SeqCst);
+            bg.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
     /// 🚀 Окно Лаунчера / Реестра ИИ-софта: список с кнопкой немедленного запуска.
     fn draw_apps_window(&mut self, ctx: &egui::Context) {
         self.windows.apps.show(ctx, |ui| {
@@ -732,6 +853,9 @@ impl eframe::App for VanguardOSApp {
         if let Some(id) = self.draw_scripts_window(ctx) {
             self.run_shell_command(&format!("/run {}", id));
         }
+
+        // 🧬 Окно самообучения: журнал своих диалогов → QLoRA-дообучение модели.
+        self.draw_trainer_window(ctx);
 
         // 📝 Автосохранение блокнота: пишем только когда текст менялся. На каждый
         // символ — лишняя запись, а полагаться на on_exit нельзя: выход через /exit —

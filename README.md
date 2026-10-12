@@ -89,10 +89,28 @@ cargo run           # первый запрос после старта демо
 
 Детали разработки (раскладка, пайплайн запроса, ловушки egui/ureq) — в [AGENTS.md](AGENTS.md).
 
+## Самообучение — окно Neural Trainer
+
+Приложение умеет дообучать **свою** модель на **своих же** диалогах:
+
+1. Каждая реплика терминала пишется в `vanguard_dialogues.jsonl` (журнал — Ваши личные
+   данные, в git не попадает).
+2. Иконка **🧬 TRAINER** открывает окно: укажите модель HuggingFace (дефолт
+   `Qwen/Qwen3.5-9B`), жмите «ЗАПУСТИТЬ ДООБУЧЕНИЕ» — в чат польётся лог тренировки.
+3. Обучение — QLoRA (4-bit NF4 + LoRA r=16) на PyTorch/CUDA; **база не меняется**,
+   адаптеры копятся в `trainer/runs/`, а финальный holdout-loss показывает, было ли
+   дообучение полезным (защита от «модель выучила шум своих же ответов»).
+
+Требования: `pip install transformers peft datasets accelerate bitsandbytes` и **CUDA-сборка**
+torch (`pip install --index-url https://download.pytorch.org/whl/cu126 --force-reinstall torch` —
+PyPI-версия по умолчанию CPU-only!). Во время тренировки модель выгружается из Ollama —
+параллельные запросы к ИИ на это время упадут по нехватке VRAM, это нормально.
+
 ## Стек
 
 Rust 2021 · [eframe/egui 0.28](https://github.com/emilk/egui) · `ureq` 3.4.2 · `sysinfo` ·
-`chrono` · `serde_json` · Python как рантайм сгенерированного кода.
+`chrono` · `serde_json` · Python как рантайм сгенерированного кода и дообучения
+(PyTorch/CUDA, transformers, peft, bitsandbytes).
 
 ## Roadmap
 

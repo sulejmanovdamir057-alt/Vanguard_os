@@ -102,6 +102,9 @@ The wiring spans several places and is easy to half-break:
 - `telemetry.rs` — background thread sampling CPU/RAM/disk into `Arc<Mutex<SystemMetrics>>`
   every 500 ms; the UI reads that guard, never calls sysinfo directly.
 - `executor.rs` — runs `vanguard_gen_<id>.py` through `python` (`python3` on non-Windows).
+- `trainer/vanguard_train.py` — QLoRA self-finetune on the app's own dialogues; launched by
+  the Neural Trainer window (`app.rs::start_trainer`) through `python`, logs stream to the GUI
+  chat line by line exactly like `/run` does.
 - `ui_window.rs` — thin `VanguardWindow` wrapper over `egui::Window`; carries `minimized`,
   which egui has no native concept of (`show()` just returns early). Also holds
   `WindowId` (the window enum) and `VanguardWindows`, which groups all five windows so the
@@ -190,6 +193,9 @@ Everything the app writes or globs uses a **relative path against the process CW
   one. No such file is tracked by git and none exist in a fresh checkout, so `/apps` prints
   "REGISTRY EMPTY" until something is generated — expected, not a bug. `/wipe` deletes every
   matching file, so it only ever destroys untracked, locally generated scripts.
+- **Dialogue journal** `vanguard_dialogues.jsonl`: every `push_user`/`push_assistant` appends one
+  JSON line (role/content/ts) via `shell.rs::log_dialogue_line` — that is the training dataset for
+  the Neural Trainer. It is personal correspondence and stays git-ignored on purpose.
 - The AI Python-code extractor in `shell.rs` only matches code fences tagged `python`.
 
 `.gitignore` covers all of the above (`vanguard_gen_*`, `vanguard_app_*`, `vanguard_script_*`,
@@ -201,6 +207,35 @@ AI-generated Rust (`shell.rs` compiles with `rustc -O`).
 
 Slash-commands: `/help /apps /run <id> /hardware /wipe /reset /exit`. Anything else that does not
 start with `/` is sent to the LLM.
+
+## Self-finetune loop — Neural Trainer window (added 2026-10-12)
+
+The app can fine-tune its own model on its own dialogues. The honest loop (not model collapse):
+
+| piece | where | behavior |
+|---|---|---|
+| dataset | `shell.rs::log_dialogue_line` | appends every user/assistant reply to `vanguard_dialogues.jsonl`; `count_dialogue_lines()` feeds the window's counter |
+| window | `WindowId::Trainer`, `app.rs::draw_trainer_window` | editable HF model id, dialogue count, start button; refuses while `is_ai_streaming` (training unloads Ollama out of VRAM) |
+| runner | `app.rs::start_trainer` | spawns `python trainer/vanguard_train.py --hf-model <HF>` on a detached thread; stdout → `AiEvent::Token` with `T: ` prefix, holds `bg_tasks`, guard flag `trainer_running` |
+| training | `trainer/vanguard_train.py` | 4-bit NF4 + LoRA r=16, loss masked to the answer only, **holdout = last 10% of pairs** printed at the end; adapter saved to `trainer/runs/lora_<time>/` (git-ignored), base model never modified; refuses below 10 pairs |
+
+Traps that will bite you:
+
+- **`pip install torch` from PyPI is CPU-only on Windows** — QLoRA then refuses to start. Install
+  `pip install --index-url https://download.pytorch.org/whl/cu126 --force-reinstall torch`
+  (driver 560.94 = CUDA 12.6; `torch.cuda.is_available()` must print True).
+- **HF model id ≠ Ollama tag**: the window defaults to `Qwen/Qwen3.5-9B` (env override
+  `VANGUARD_TRAIN_HF_MODEL`). A 9B 4-bit load is ~5.6 GB + LoRA ≈ 8 GB — that only fits because
+  the script first calls Ollama `/api/generate keep_alive:0` to evict the resident model. Ollama
+  answering AI queries during training will fail with a VRAM error — expected.
+- **Guard the holdout loss**: `summary.json` next to the adapter carries train/holdout loss. If
+  holdout did not improve vs the baseline, the adapter learned noise — do not merge it into GGUF.
+- A 9B HF download is ~18 GB the first time; the smoke test
+  `--hf-model Qwen/Qwen2.5-0.5B-Instruct --steps 3` runs in minutes and validates the whole chain
+  (verified end-to-end 2026-10-12: LoRA attached 8.8M/502M params, 3 steps ≈ 3.5 s, adapter +
+  `summary.json` written, holdout loss computed).
+- transformers 5.19 **removed `warmup_ratio`** from `TrainingArguments` — only `warmup_steps`
+  exists; `torch_dtype` is deprecated in favor of `dtype`. The script uses the new names.
 
 ## `src/optimize_project.py` — AI refactoring, now compile-gated (rewritten 2026-10-11)
 
