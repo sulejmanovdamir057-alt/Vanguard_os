@@ -11,7 +11,7 @@ use regex::Regex;
 
 // Действия и события ИИ приходят из ядра (ai_core) — там же протокол VanguardAction.
 use crate::ai_core::{AiEvent, VanguardAction};
-use crate::executor::VanguardExecutor;
+use crate::core::executor::VanguardExecutor;
 
 /// Сколько сообщений уходит в запрос. Это 12 реплик: замерено на этой машине, что 10 реплик
 /// поднимают prompt_tokens с ~309 до ~1169 и стоят +0.4 с пребилда, дальше контекст дешёвым
@@ -55,7 +55,7 @@ pub fn count_dialogue_lines() -> usize {
 /// Имя файла `vanguard_gen_553.py` -> Some("553"), всё остальное -> None.
 /// Префикс `vanguard_gen_` — 13 байт, расширение `.py` — 3. Один разбор на все
 /// места, где показывается ID: `/apps` в шелле и окна Лаунчера/Проводника в app.rs.
-pub(crate) fn script_id_from_path(path: &str) -> Option<String> {
+pub fn script_id_from_path(path: &str) -> Option<String> {
     let name = std::path::Path::new(path).file_name()?.to_string_lossy().into_owned();
     if name.len() > 16 { Some(name[13..name.len() - 3].to_string()) } else { None }
 }

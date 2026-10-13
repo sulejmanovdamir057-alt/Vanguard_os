@@ -2,6 +2,8 @@
 name = "vanguard_os"
 version = "0.2.0"
 edition = "2021"
+# Два бинарника — `cargo run` должен запускать оболочку, а не ядро.
+default-run = "vanguard_os"
 
 [dependencies]
 # Графический движок для высокоскоростного рендеринга окон и Canvas на видеокарте
@@ -34,3 +36,22 @@ serde_json = "1.0"
 
 # ФИКС: Ультра-легкий HTTP-клиент ureq v3 с поддержкой нативного TLS для HTTPS-запросов к DeepSeek
 ureq = { version = "3.0", features = ["native-tls"] }
+
+# ── Раздельные бинарники: ядро и оболочка ──
+# Ядро (движок) и оболочка (egui-рендер) — два процесса. Общие типы и протокол
+# IPC — в src/lib.rs, чтобы протокол не разъехался. ИИ-помощник добавится позже.
+
+# Библиотека: общий протокол IPC (src/ipc.rs) + движок (src/core/*) + граница ИИ (src/ai_core.rs)
+[lib]
+name = "vanguard_os_lib"
+path = "src/lib.rs"
+
+# Оболочка: egui-приложение (src/main.rs)
+[[bin]]
+name = "vanguard_os"
+path = "src/main.rs"
+
+# Ядро: TCP-сервер движка без GUI (src/bin/core.rs)
+[[bin]]
+name = "vanguard_core"
+path = "src/bin/core.rs"

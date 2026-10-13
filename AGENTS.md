@@ -1,33 +1,75 @@
 # AGENTS.md
 
-Single-crate Rust desktop app (`vanguard_os`, edition 2021): an egui/eframe "fake OS" with a
-boot animation, a desktop, and a terminal that handles slash-commands, calls a remote LLM, and
-writes/executes generated scripts. It is a port of a Python prototype — `Cargo.toml` comments
-name the Python module each dependency replaces. Comments and log strings are Russian/English
-mixed; keep that style.
+Rust project (`vanguard_os`, edition 2021): an egui/eframe "fake OS" with a boot animation, a
+desktop, and a terminal that handles slash-commands, calls a remote LLM, and writes/executes
+generated scripts. It is a port of a Python prototype — `Cargo.toml` comments name the Python
+module each dependency replaces. Comments and log strings are Russian/English mixed; keep that
+style.
+
+**Two binaries + one lib** (since Stage 2, 2026-10-13). The engine is a separate process from
+the GUI:
+
+- `vanguard_os` (default for `cargo run`) — the **shell**: egui render, AI stream to Ollama,
+  and an IPC *client*. Entry `src/main.rs`.
+- `vanguard_core` — the **core**: TCP server on `127.0.0.1:7331` doing the heavy/system work
+  (slash-commands, `/run`, `rustc -O` compilation, telemetry). Entry `src/bin/core.rs`. The
+  shell **autostarts it on demand** (see `ipc_client.rs`), so `cargo run` alone is enough.
+- `vanguard_os_lib` (`src/lib.rs`) — shared code: the IPC protocol, `ai_core`, and the engine
+  moved to `src/core/{shell,executor,telemetry}.rs`. Both binaries are thin wrappers over it,
+  which is what keeps the protocol from drifting apart.
+
+The split exists for one measured reason: `rustc -O` compilation used to run on the UI thread
+and froze the render for seconds. Everything else stayed in the shell because it is not heavy
+(AI streaming is SSE on a background thread already).
 
 ## Commands
 
 - `cargo check` — the only fast verification. There are no tests, no lint/fmt/typecheck config,
   no CI, no codegen. `cargo test` finds nothing.
-- `cargo run` — builds and opens the maximized GUI window (blocks; Windows-targeted).
+  - **On Windows, `cargo check 2>&1` from PowerShell exits with code 1 even on success**: `2>&1`
+    merges cargo's (empty) stderr into the PowerShell error stream, and PS 5.1's
+    `NativeCommandError` then sets `$LASTEXITCODE = 1`. The tell is the line
+    `Finished dev profile ...` with no `error`/`warning:` lines above it — trust that, not the
+    exit code. To get a truthful exit code, redirect to a file: `cargo check > $env:TEMP\c.txt`
+    then inspect `$LASTEXITCODE`, or grep the file for `^(error|warning)`.
+- `cargo run` — with `default-run = "vanguard_os"` this builds and opens the maximized GUI
+  window (blocks; Windows-targeted). It does **not** launch the core: the shell spawns
+  `vanguard_core.exe` itself the first time it needs it (`ipc_client::spawn_core_process`),
+  looking for it next to its own exe — so both binaries must be built (`cargo build` builds
+  both) and run from `target/debug` (or any dir holding both). You can also start the core
+  yourself first; the shell will just connect instead of spawning.
+- `cargo run --bin vanguard_core` — run the core alone, no GUI. It prints `vanguard_core:
+  не удалось занять 127.0.0.1:7331` to stderr and exits if the port is taken. Handy for
+  debugging IPC: it keeps running after the shell closes, so a second `cargo run` reuses it.
 - UI is verified manually only. The boot animation auto-advances to `Ready` and then **stops
   until you press a key**; the desktop and the command input line only appear after that. A
   window sitting on "PRESS ANY KEY" is normal, not a hang.
+  - Do **not** try to drive the GUI with `PostMessage`/`SendInput` from a script: egui/winit
+    ignores injected input unless the window has real OS focus, and `SetForegroundWindow` from
+    a background process is blocked by Windows. Typing into it that way produces garbage (VK
+    codes interpreted through the *Russian* layout) and can leak keystrokes into whatever
+    window *does* have focus — including a game. Test IPC against the core directly over TCP
+    (`{"cmd":"ping"}` on 127.0.0.1:7331) and leave GUI clicks to a human.
 
 ## Build state — re-run before trusting this
 
-`cargo check` passes with **no warnings**.
+`cargo check` (and `cargo build`) pass with **no warnings**, covering the lib plus both bins.
 
 `app.rs`, `ai_core.rs` and `Cargo.toml` change often, so re-run `cargo check` yourself rather
-than assuming this snapshot still holds.
+than assuming this snapshot still holds. `ipc.rs` is the one file where a "harmless" edit breaks
+the wire silently — see the IPC section below.
 
 ## No console output
 
-Progress is shown **only** in the GUI chat (`ai_text_area`); the boot banner and the
+Progress in the GUI is shown **only** in the chat (`ai_text_area`); the boot banner and the
 `println!`-duplicates in `send_ai_query` were removed. The one remaining `println!` is a `None`
-fallback in `shell.rs` for when `shell.log_tx` is unset, and `ai_core.rs:43` matches only
-because `println!` appears inside the prompt's JSON example string.
+fallback in `src/core/shell.rs` for when `shell.log_tx` is unset, and `ai_core.rs:43` matches
+only because `println!` appears inside the prompt's JSON example string.
+
+The **core** (`src/bin/core.rs`) does write to stderr with `eprintln!` — but only for "couldn't
+bind 7331" / "accept failed". That is deliberate: when autostarted by the shell it is spawned
+with `Stdio::null()` and `CREATE_NO_WINDOW`, so nothing reaches a console. Run
+`vanguard_core.exe` by hand from a terminal and those lines are the only diagnostics there is.
 
 ## AI request pipeline — read before touching `app.rs`
 
@@ -63,7 +105,7 @@ The wiring spans several places and is easy to half-break:
 - `app.rs` holds `ai_stream_marker: Option<usize>` = `ai_text_area.len()` captured on the first
   `Delta`. Every `Delta` truncates back to it and rewrites `"V: " + preview`; `ExecuteAction` and
   `Error` truncate to it before pushing the final output. The `V: ` is **duplicated on purpose** —
-  it mirrors `shell.rs:159`'s `format!("V: {}\n", text)`, otherwise the line jumps 3 chars right
+  it mirrors `src/core/shell.rs:229`'s `format!("V: {}\n", text)`, otherwise the line jumps 3 chars right
   at completion. Removing the marker makes the chat show the preview *and* the answer stacked.
 - `is_ai_streaming` is cleared only by `AiEvent::Finished` or `AiEvent::Error`. If it never
   clears, every later prompt is rejected with "Предыдущий нейро-поток еще активен" until restart.
@@ -78,38 +120,87 @@ The wiring spans several places and is easy to half-break:
   for `TextResponse`, the "created script, run with `/run <id>`" log otherwise) **must** be pushed
   into `ai_text_area`. Discarding it hid the AI's answers entirely and stopped
   `save_code_if_exists` from ever seeing generated code, since it scans `ai_text_area`.
+  - **One branch does not run locally.** If the action is `CreateScript` with `language == "rust"`,
+    `app.rs::check_ai_stream` does *not* call `execute_ai_action`. It prints a placeholder, spawns
+    a thread that sends `Request::CompileRust` to the core, and the reply comes back later as
+    `AiEvent::ActionOutput` (see the IPC section below). `execute_ai_action`'s own `rust` arm is
+    now only a fallback for when the core is unreachable — keep the two in sync.
 
-## Module map (`src/`)
+## Module map
 
-- `main.rs` — entry point: spawns the telemetry daemon, then `eframe::run_native`. Prints
-  nothing to stdout (the banner and init logs were removed).
-- `app.rs` — `VanguardOSApp` implements `eframe::App`; owns boot stages, all windows (grouped
-  in `VanguardWindows`), the AI stream, and the command input entrypoint (`send_ai_query`).
-  The desktop itself was extracted to `desktop.rs`; `app.rs` only builds a `DesktopHost`
-  each frame and executes the returned `DesktopIntent`s via `apply_desktop_intent`.
-- `desktop.rs` — the whole desktop surface: background grid, top bar, widgets, icon grid,
+Layout follows the process split — engine in the lib, GUI in the shell binary:
+
+- `src/lib.rs` — `vanguard_os_lib`. Declares the four public modules below. Both binaries
+  depend on it; that is the only way they share types.
+- `src/ipc.rs` — the IPC protocol and nothing else: `Request`/`Response`/`Event` enums
+  (serde, `tag = "cmd"`/`"kind"`, `snake_case`) plus `CORE_PORT` (7331) and `core_addr()`.
+  Single source of truth for the wire format. Add a request here first, then a handler in
+  `bin/core.rs`, then a caller.
+- `src/ai_core.rs` — `spawn_ai_request`: env config, SSE streaming reader, `extract_preview`,
+  plus the `VanguardAction` JSON protocol. Non-2xx does not reach here as an error (the agent
+  is built with `http_status_as_error(false)`), the status is checked before parsing. Lives in
+  the lib because the future `vanguard_ai` assistant will reuse it; the shell calls it over an
+  in-process channel, not IPC.
+- `src/core/shell.rs` — `VanguardShell::handle_command` parses `/…` and returns a `ShellAction`;
+  `execute_ai_action` carries out AI-requested work. Still called from the shell's
+  `check_ai_stream`, but its `/run` and `rustc` paths are now also reachable through the core
+  (see `bin/core.rs`).
+- `src/core/executor.rs` — runs `vanguard_gen_<id>.py` through `python` (`python3` on
+  non-Windows). Used by both processes.
+- `src/core/telemetry.rs` — background thread sampling CPU/RAM/disk into
+  `Arc<Mutex<SystemMetrics>>` every 500 ms; the UI reads that guard, never calls sysinfo
+  directly. Each process spawns its own daemon — the core's is for `/hardware`, the shell's
+  for the desktop graphs.
+- `src/bin/core.rs` — `vanguard_core` main: binds `127.0.0.1:7331`, one thread per connection,
+  each with its own `VanguardShell` (independent dialogue history). Maps `Request` → work:
+  `Shell` → `dispatch_shell`, `RunScript`/`CompileRust` → background thread streaming
+  `Event::TaskLog` back over the same socket, the rest synchronously. `send()` swallows write
+  errors on purpose — a client that disconnected mid-stream must not panic the core.
+- `src/main.rs` — `vanguard_os` main: spawns the shell's telemetry daemon, then
+  `eframe::run_native`. `#![windows_subsystem = "windows"]`, prints nothing to stdout.
+- `src/app.rs` — `VanguardOSApp` implements `eframe::App`; owns boot stages, all windows
+  (grouped in `VanguardWindows`), the AI stream, the IPC client calls, and the command input
+  entrypoint (`send_ai_query`). The desktop itself was extracted to `desktop.rs`; `app.rs` only
+  builds a `DesktopHost` each frame and executes the returned `DesktopIntent`s via
+  `apply_desktop_intent`.
+- `src/ipc_client.rs` — the shell's side of IPC: `call()` connects, autostarts `vanguard_core.exe`
+  if nothing is listening (3 s of retries, spawned with `CREATE_NO_WINDOW`), sends one request,
+  and reads responses **until a final `Ok`/`Err`/`Pong`** — see the warning below.
+- `src/desktop.rs` — the whole desktop surface: background grid, top bar, widgets, icon grid,
   context menu, taskbar, AI output area and the input line. It **owns no windows, shell or
   chat**: it reaches them through `DesktopHost` (a struct of borrows for one frame) and
   returns `Vec<DesktopIntent>` for `app.rs` to run. Geometry is hardcoded here, not in
   `app.rs`.
-- `shell.rs` — `VanguardShell::handle_command` parses `/…` commands and returns a `ShellAction`;
-  `execute_ai_action` carries out AI-requested work (writes/compiles files) and is called from
-  `app.rs::check_ai_stream`. `/run` ships its log over `log_tx` as `AiEvent::Token` and holds a
-  `bg_tasks` count while the script runs.
-- `ai_core.rs` — `spawn_ai_request`: env config, SSE streaming reader, `extract_preview`,
-  plus the `VanguardAction` JSON protocol. Non-2xx does not reach here as an error (the agent
-  is built with `http_status_as_error(false)`), the status is checked before parsing.
-- `telemetry.rs` — background thread sampling CPU/RAM/disk into `Arc<Mutex<SystemMetrics>>`
-  every 500 ms; the UI reads that guard, never calls sysinfo directly.
-- `executor.rs` — runs `vanguard_gen_<id>.py` through `python` (`python3` on non-Windows).
-- `trainer/vanguard_train.py` — QLoRA self-finetune on the app's own dialogues; launched by
-  the Neural Trainer window (`app.rs::start_trainer`) through `python`, logs stream to the GUI
-  chat line by line exactly like `/run` does.
-- `ui_window.rs` — thin `VanguardWindow` wrapper over `egui::Window`; carries `minimized`,
+- `src/ui_window.rs` — thin `VanguardWindow` wrapper over `egui::Window`; carries `minimized`,
   which egui has no native concept of (`show()` just returns early). Also holds
   `WindowId` (the window enum) and `VanguardWindows`, which groups all five windows so the
   taskbar can enumerate them via `WindowId::ALL`.
+- `trainer/vanguard_train.py` — QLoRA self-finetune on the app's own dialogues; launched by
+  the Neural Trainer window (`app.rs::start_trainer`) through `python`, logs stream to the GUI
+  chat line by line exactly like `/run` does.
 - `*.rs.bak` are generated artifacts, not source (see below).
+
+## IPC — the one rule that is easy to get wrong
+
+`ipc_client::call` must stop reading at the **final** response (`Ok`/`Err`/`Pong`). The core
+serves each connection in a loop waiting for the *next* request, so the socket stays open; if
+the client read to EOF it would block until the 30 s read timeout on every call. Events
+(`Event::TaskLog`) always precede the final `Ok` for their request — one `/run` = N events
+then `Ok("<< TASK DONE >>")`. `saw_final` + `break` in the match arms is what makes this work;
+do not "clean it up" into a plain `for` loop.
+
+Two more invariants:
+
+- **Heavy work is async and holds `bg_tasks`.** `app.rs::try_core_run` and the AI's Rust-compile
+  path both `fetch_add` on `shell.bg_tasks` before spawning the IPC thread and `fetch_sub`
+  after sending the reply. `update()`'s repaint guard reads that counter, so dropping it stalls
+  `/run` output and compile results until the next mouse move — the same failure mode as the
+  `is_ai_streaming` guard above.
+- **A reply can arrive after a new stream started.** `AiEvent::ActionOutput` (compile result)
+  is inserted *at* `ai_stream_marker`, not appended, and the marker is shifted by the inserted
+  length — otherwise the next `Delta` truncation would delete the result. It also does not go
+  into dialogue history: `ExecuteAction` already pushed a placeholder when it dispatched the
+  compile.
 
 ## Desktop layout and widgets
 
@@ -180,10 +271,21 @@ Widgets and features added on top of the original desktop:
 
 ## Runtime file side effects — run the app from the repo root
 
-Everything the app writes or globs uses a **relative path against the process CWD**:
+Everything the app writes or globs uses a **relative path against the process CWD** — and after
+the split there are **two processes with two CWDs**:
 
-- Generated artifacts: `vanguard_gen_<id>.py`, `vanguard_tmp_<id>.rs`, `vanguard_app_<id>.exe`,
-  `vanguard_script_<id>.bat|.sh`.
+- **The shell** (`vanguard_os`) writes `vanguard_notes.txt`, and globs `vanguard_gen_*.py` for
+  `/apps`, the LAUNCHER and the Script Explorer.
+- **The core** (`vanguard_core`) is what actually runs `/run` and compiles AI Rust. When the
+  shell **spawns** it via `ipc_client::spawn_core_process`, the child inherits the shell's CWD,
+  so both see the same files. But if you start the core **yourself** from another directory
+  (`cargo run --bin vanguard_core` from `src/`, say), its CWD differs and `/run` will report
+  "file not found" for scripts the shell can clearly see. **Start the core from the repo root**
+  (or let the shell spawn it) — that is the whole reason `cargo run` alone is enough.
+
+Generated artifacts, all relative to the *core's* CWD: `vanguard_gen_<id>.py`,
+`vanguard_tmp_<id>.rs`, `vanguard_app_<id>.exe`, `vanguard_script_<id>.bat|.sh`.
+
 - Notes autosave: the Notes window writes `vanguard_notes.txt` whenever the text changes
   (`app.rs::update`, gated on `notes_dirty`) and reloads it at startup. The save is
   **not** tied to shutdown — `/exit` is `process::exit(0)`, so `eframe::on_exit` never runs and
@@ -194,16 +296,18 @@ Everything the app writes or globs uses a **relative path against the process CW
   "REGISTRY EMPTY" until something is generated — expected, not a bug. `/wipe` deletes every
   matching file, so it only ever destroys untracked, locally generated scripts.
 - **Dialogue journal** `vanguard_dialogues.jsonl`: every `push_user`/`push_assistant` appends one
-  JSON line (role/content/ts) via `shell.rs::log_dialogue_line` — that is the training dataset for
+  JSON line (role/content/ts) via `src/core/shell.rs::log_dialogue_line` — that is the training dataset for
   the Neural Trainer. It is personal correspondence and stays git-ignored on purpose.
-- The AI Python-code extractor in `shell.rs` only matches code fences tagged `python`.
+- The AI Python-code extractor in `src/core/shell.rs` only matches code fences tagged `python`.
 
 `.gitignore` covers all of the above (`vanguard_gen_*`, `vanguard_app_*`, `vanguard_script_*`,
 `vanguard_tmp_*`, `vanguard_notes.txt`, `*.rs.bak`), so a clean checkout stays clean. The older
 note that "`.gitignore` contains only `/target`" is long obsolete — do not trust it.
 
 External tool requirements for those paths: `python` on PATH for `/run`, `rustc` on PATH for
-AI-generated Rust (`shell.rs` compiles with `rustc -O`).
+AI-generated Rust (the **core** compiles with `rustc -O` — see `src/bin/core.rs::compile_rust`;
+the shell's local `execute_ai_action` still has a `rustc` branch as a fallback when the core is
+down, and both must stay in sync if you change compile flags).
 
 Slash-commands: `/help /apps /run <id> /hardware /wipe /reset /exit`. Anything else that does not
 start with `/` is sent to the LLM.
@@ -214,7 +318,7 @@ The app can fine-tune its own model on its own dialogues. The honest loop (not m
 
 | piece | where | behavior |
 |---|---|---|
-| dataset | `shell.rs::log_dialogue_line` | appends every user/assistant reply to `vanguard_dialogues.jsonl`; `count_dialogue_lines()` feeds the window's counter |
+| dataset | `src/core/shell.rs::log_dialogue_line` | appends every user/assistant reply to `vanguard_dialogues.jsonl`; `count_dialogue_lines()` feeds the window's counter |
 | window | `WindowId::Trainer`, `app.rs::draw_trainer_window` | editable HF model id, dialogue count, start button; refuses while `is_ai_streaming` (training unloads Ollama out of VRAM) |
 | runner | `app.rs::start_trainer` | spawns `python trainer/vanguard_train.py --hf-model <HF>` on a detached thread; stdout → `AiEvent::Token` with `T: ` prefix, holds `bg_tasks`, guard flag `trainer_running` |
 | training | `trainer/vanguard_train.py` | 4-bit NF4 + LoRA r=16, loss masked to the answer only, **holdout = last 10% of pairs** printed at the end; adapter saved to `trainer/runs/lora_<time>/` (git-ignored), base model never modified; refuses below 10 pairs |
@@ -383,13 +487,18 @@ memory of previous turns at all. The `VanguardAI::history` **string** that exist
 `messages` was written by `save_code_if_exists` and **read by nobody** — it has been deleted
 during a readability cleanup; `messages` is now the single copy of the dialogue.
 
-- The dialogue lives in `VanguardAI::messages` (`shell.rs`), capped at `MAX_HISTORY_MESSAGES`
+- The dialogue lives in `VanguardAI::messages` (`src/core/shell.rs`), capped at `MAX_HISTORY_MESSAGES`
   (24 = 12 exchanges). Ten exchanges measurably cost +0.4 s of prefill (309 → 1169 prompt
   tokens), which is why there is a cap instead of "keep everything".
 - `app.rs::send_ai_query` calls `push_user` **before** spawning, and
   `check_ai_stream::ExecuteAction` calls `push_assistant` with the text `execute_ai_action`
   returned. Both ends are needed: without the assistant half the history would be a list of
   questions the model never answered.
+  - **Exception — AI-requested Rust compilation.** That path is now async (`Request::CompileRust`
+    over IPC), so `push_assistant` gets a placeholder acknowledgement ("Компиляция Rust ушла в
+    ядро…") at dispatch time, not the real result. The compile result arrives later as
+    `AiEvent::ActionOutput` and is **not** pushed into history — otherwise a slow `rustc` would
+    land in the dialogue after a *newer* user message and scramble the turn order.
 - On `AiEvent::Error` the trailing user message is popped, otherwise the next request would
   show the model a prompt it never got to answer.
 - `/reset` and `Ctrl+L` go through `clear_memory`, which now clears `messages` too.

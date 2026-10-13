@@ -10,15 +10,68 @@ use glob::glob;
 use rand::Rng;
 
 // Подключение внутренних модулей проекта
-use crate::ai_core::{AiEvent, configured_model, configured_url};
-use crate::telemetry::SystemMetrics;
-use crate::shell::{script_id_from_path, ShellAction, VanguardShell};
+use vanguard_os_lib::ai_core::{AiEvent, VanguardAction, configured_model, configured_url};
+use vanguard_os_lib::core::telemetry::SystemMetrics;
+use vanguard_os_lib::core::shell::{script_id_from_path, ShellAction, VanguardShell};
+use vanguard_os_lib::ipc::Request;
 use crate::desktop::{Desktop, DesktopHost, DesktopIntent, INPUT_FIELD_ID};
-use crate::ui_window::VanguardWindows;
+use crate::ui_window::{VanguardWindows, WindowId};
 
 
 /// Файл заметков блокнота. Пишется относительно CWD — как и все артефакты проекта.
 const NOTES_FILE: &str = "vanguard_notes.txt";
+
+/// Прогулка по истории команд: `dir` = -1 (↑, старше) или +1 (↓, новее). За последней
+/// командой вниз — пустой черновик. Текст поля заменяется, курсор — в конец.
+///
+/// Свободная функция, а не метод: вызывается из замыкания окна терминала, где
+/// `&mut self` целиком уже занят отрисовкой этого окна — здесь заимствуются
+/// только три нужных поля, и это компилируется.
+fn walk_history(
+    history: &[String],
+    hist_pos: &mut Option<usize>,
+    input: &mut String,
+    dir: i32,
+    ctx: &egui::Context,
+) {
+    if history.is_empty() {
+        return;
+    }
+    let len = history.len();
+    let pos = hist_pos.unwrap_or(len);
+    let new_pos = if dir < 0 { pos.saturating_sub(1) } else { (pos + 1).min(len) };
+    if new_pos < len {
+        *input = history[new_pos].clone();
+        *hist_pos = Some(new_pos);
+    } else {
+        input.clear();
+        *hist_pos = None;
+    }
+    // egui держит курсор там, где был: после подстановки ставим его в конец,
+    // иначе править просмотренную команду неудобно.
+    let n = input.chars().count();
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, egui::Id::new(INPUT_FIELD_ID)) {
+        let end = egui::text::CCursor::new(n);
+        state.cursor = egui::text::CCursorRange::one(end).into();
+        state.store(ctx, egui::Id::new(INPUT_FIELD_ID));
+    }
+}
+
+/// Реестр сгенерированных скриптов, свежие сверху — раздел «Рекомендуется»
+/// меню «Пуск». ID берём тем же разбором имени, что и шелл (`/run <id>`).
+fn recent_scripts_scan() -> Vec<(String, String)> {
+    let mut items: Vec<(std::time::SystemTime, String, String)> = Vec::new();
+    if let Ok(paths) = glob("vanguard_gen_*.py") {
+        for p in paths.flatten() {
+            let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let id = script_id_from_path(&name).unwrap_or_default();
+            let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            items.push((mtime, id, name));
+        }
+    }
+    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.into_iter().take(6).map(|(_, id, name)| (id, name)).collect()
+}
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum BootStage { BarLoading, KernelLogs, Ready, Explosion, Desktop }
@@ -99,6 +152,16 @@ pub struct VanguardOSApp {
     trainer_count: usize,
     trainer_status: String,
     trainer_running: Arc<AtomicBool>,
+    // ⌨️ История команд строки ввода (↑/↓) — переехала сюда из Desktop вместе
+    // с терминалом, ставшим обычным окном.
+    cmd_history: Vec<String>,
+    cmd_hist_pos: Option<usize>,
+    // Просьба поставить фокус в строку ввода: TextEdit живёт в окне терминала,
+    // поэтому фокус запрашиваем после создания виджета, а не по хоткею напрямую.
+    focus_input_pending: bool,
+    // Реестр скриптов для «Рекомендуется» меню «Пуск»; обновляется в update(),
+    // пока меню открыто (glob на каждый кадр был бы лишней работой).
+    recent_scripts: Vec<(String, String)>,
     /// Рабочий стол: раскладка иконок, контекстное меню и прочее собственное
     /// состояние. Всё, что рисуется на CentralPanel после заставки, живёт в desktop.rs.
     desktop: Desktop,
@@ -121,8 +184,61 @@ pub struct VanguardOSApp {
 impl VanguardOSApp {
     pub fn new(cc: &eframe::CreationContext<'_>, metrics: Arc<Mutex<SystemMetrics>>) -> Self {
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(0, 0, 0);
+        // Палитра Windows 11 dark: окна #202020, рамка #3A3A3A, акцент #0078D4.
+        // Красные акценты Vanguard OS остаются там, где их рисует код приложения
+        // (терминал, графики, лого), а не здесь.
+        visuals.panel_fill = egui::Color32::from_rgb(15, 17, 24);   // подложка под обоями
+        visuals.window_fill = egui::Color32::from_rgb(32, 32, 32);
+        visuals.window_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(58, 58, 58));
+        visuals.window_rounding = egui::Rounding::same(8.0);
+        visuals.menu_rounding = egui::Rounding::same(6.0);
+        visuals.popup_shadow = egui::epaint::Shadow {
+            offset: [0.0, 8.0].into(),
+            blur: 24.0,
+            spread: 0.0,
+            color: egui::Color32::from_black_alpha(120),
+        };
+        visuals.extreme_bg_color = egui::Color32::from_rgb(42, 42, 46);   // поля ввода
+        visuals.faint_bg_color = egui::Color32::from_rgb(38, 38, 42);
+        visuals.code_bg_color = egui::Color32::from_rgb(24, 24, 28);
+        visuals.selection.bg_fill = egui::Color32::from_rgb(0, 120, 212);
+        visuals.hyperlink_color = egui::Color32::from_rgb(77, 166, 255);
+        for w in [
+            &mut visuals.widgets.noninteractive,
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+        ] {
+            w.rounding = egui::Rounding::same(4.0);
+        }
+        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(58, 58, 62);
+        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(74, 74, 80);
+        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(0, 120, 212);
         cc.egui_ctx.set_visuals(visuals);
+
+        // Windows-шрифты: Segoe UI (интерфейс) и Consolas (терминал). Если файлов
+        // нет (не Windows) — остаются шрифты egui, приложение не падает.
+        let mut fonts = egui::FontDefinitions::default();
+        if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
+            fonts.font_data.insert("segoe".to_string(), egui::FontData::from_owned(bytes).into());
+            fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "segoe".to_string());
+        }
+        // Segoe UI Symbol: ✎ ❯ ⚙ ▦ и прочие знаки интерфейса, которых нет в
+        // самом Segoe UI. Стоит сразу после него в цепочке подстановки.
+        if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
+            fonts.font_data.insert("seguisym".to_string(), egui::FontData::from_owned(bytes).into());
+            fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(1, "seguisym".to_string());
+        }
+        let mono_path = ["C:\\Windows\\Fonts\\consola.ttf", "C:\\Windows\\Fonts\\CascadiaMono.ttf"]
+            .into_iter()
+            .find(|p| std::fs::metadata(p).is_ok());
+        if let Some(path) = mono_path {
+            if let Ok(bytes) = std::fs::read(path) {
+                fonts.font_data.insert("winmono".to_string(), egui::FontData::from_owned(bytes).into());
+                fonts.families.get_mut(&egui::FontFamily::Monospace).unwrap().insert(0, "winmono".to_string());
+            }
+        }
+        cc.egui_ctx.set_fonts(fonts);
 
         let mut cpu_hist = VecDeque::with_capacity(20);
         for _ in 0..20 { cpu_hist.push_back(0.0); }
@@ -155,9 +271,13 @@ impl VanguardOSApp {
             // или полем в окне Trainer.
             trainer_hf_model: std::env::var("VANGUARD_TRAIN_HF_MODEL")
                 .unwrap_or_else(|_| String::from("Qwen/Qwen3.5-9B")),
-            trainer_count: crate::shell::count_dialogue_lines(),
+            trainer_count: vanguard_os_lib::core::shell::count_dialogue_lines(),
             trainer_status: String::from("Готов к тренировке."),
             trainer_running: Arc::new(AtomicBool::new(false)),
+            cmd_history: Vec::new(),
+            cmd_hist_pos: None,
+            focus_input_pending: false,
+            recent_scripts: Vec::new(),
             desktop: Desktop::new(),
             backend_alive: Arc::new(AtomicBool::new(false)),
             ai_model_name: configured_model(),
@@ -177,6 +297,11 @@ impl VanguardOSApp {
         // Логи фоновых задач (/run) показываем в GUI-чате, а не в консоли
         let log_tx = app.ai_event_tx.clone();
         app.shell.log_tx = Some(log_tx);
+
+        // Терминал открывается сразу — раньше он жил прямо на столе, а с оконным
+        // хромом стал обычным приложением. Позиция детерминированная, не случайная.
+        app.windows.terminal.is_open = true;
+        app.windows.terminal.default_pos = egui::pos2(380.0, 56.0);
 
         // 💚 Пробник бэкенда ИИ: TCP-коннект к host:port раз в 2 с. Статус-строка стола
         // показывает ONLINE/OFFLINE, поэтому нужен живой признак — но проверять его прямо
@@ -341,16 +466,25 @@ impl VanguardOSApp {
     /// ни шелл, ни чат, ни окна — он лишь перечисляет, что сделать, а здесь это
     /// выполняется. Так раскладка не тянет за собой `&mut self` целиком и не
     /// дралась бы с borrow-checker'ом о заимствование нескольких полей сразу.
-    fn apply_desktop_intent(&mut self, intent: DesktopIntent, ctx: &egui::Context) {
+    fn apply_desktop_intent(&mut self, intent: DesktopIntent, _ctx: &egui::Context) {
         match intent {
-            DesktopIntent::SubmitInput => self.send_ai_query(),
-            DesktopIntent::FocusInput => ctx.memory_mut(|m| m.request_focus(egui::Id::new(INPUT_FIELD_ID))),
+            DesktopIntent::FocusInput => {
+                // Терминал — обычное окно: сначала раскрываем его, а фокус
+                // попросим в draw_terminal_window, когда поле будет создано.
+                self.windows.open(WindowId::Terminal);
+                self.focus_input_pending = true;
+            }
             DesktopIntent::RunCommand(cmd) => self.run_shell_command(&cmd),
             DesktopIntent::ClearChat => self.clear_chat(),
             DesktopIntent::OpenWindow(id) => self.windows.open(id),
             DesktopIntent::ToggleWindowMinimized(id) => {
                 let w = self.windows.get_mut(id);
                 w.minimized = !w.minimized;
+            }
+            DesktopIntent::MinimizeAll => {
+                for wid in WindowId::ALL {
+                    self.windows.get_mut(wid).minimized = true;
+                }
             }
         }
     }
@@ -359,8 +493,54 @@ impl VanguardOSApp {
     /// send_ai_query, но без строки приглашения и без стриминга — контекстное меню и
     /// проводник шлют сюда только команды, возвращающие DisplayOutput.
     fn run_shell_command(&mut self, cmd: &str) {
+        // `/run` уходит в ядро (IPC): скрипт крутится в отдельном процессе,
+        // лог приходит потоком в чат. Остальные команды — локальный шелл.
+        if self.try_core_run(cmd) {
+            return;
+        }
         let action = self.shell.handle_command(cmd);
         self.apply_shell_command(action);
+    }
+
+    /// `/run <id>` исполняет ядро — отдельный процесс `vanguard_core.exe`, куда
+    /// оболочка ушла по IPC. Оболочка только печатает строку инициации (как это
+    /// делал шелл) и держит `bg_tasks`, пока лог не дотечёт токеном в чат.
+    /// Возвращает false для всего, что не `/run <id>` — такое ведёт себя локально.
+    fn try_core_run(&mut self, cmd: &str) -> bool {
+        let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
+        if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("/run") {
+            return false;
+        }
+        let id = parts[1..].join(" ");
+        // В точности строка, которую раньше вернул DisplayOutput (он добавлял
+        // второй \n через apply_shell_command) — раскладка чата не меняется.
+        self.ai_text_area
+            .push_str(&format!(">> INITIATING BACKGROUND TASK FOR APP ID: {}...\n\n", id));
+
+        let tx = self.ai_event_tx.clone();
+        let bg = Arc::clone(&self.shell.bg_tasks);
+        bg.fetch_add(1, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            let request = serde_json::to_string(&Request::RunScript { id: id.clone() })
+                .unwrap_or_default();
+            let reply = crate::ipc_client::call(&request);
+            if reply.ok {
+                if !reply.text.is_empty() {
+                    let _ = tx.send(AiEvent::Token(reply.text));
+                }
+            } else {
+                // Ядро не поднялось (не собран vanguard_core.exe?) — запускаем
+                // локально, чтобы /run не сдох совсем; причина тоже в чате.
+                let _ = tx.send(AiEvent::Token(format!(
+                    "{}\n>> Ядро недоступно — скрипт выполнен локально.\n",
+                    reply.text
+                )));
+                let log = vanguard_os_lib::core::executor::VanguardExecutor::execute_script(&id);
+                let _ = tx.send(AiEvent::Token(format!("\n{}\n", log)));
+            }
+            bg.fetch_sub(1, Ordering::SeqCst);
+        });
+        true
     }
 
     /// Общая судьба не-AI действий шелла: вывод — в чат, выход — завершение процесса.
@@ -379,6 +559,163 @@ impl VanguardOSApp {
     // ─── Содержимое окон ─────────────────────────────────────────────
     // Раньше всё это жило анонимными замыканиями прямо в update(); вынесено
     // в методы, чтобы кадр читался как список шагов, а не как стена кода.
+
+    /// 🧠 Окно ИИ-терминала: чат с моделью и строка ввода команд. Раньше это
+    /// жило прямо на столе (draw_chat_and_input в desktop.rs) — с переходом на
+    /// оконный хром виндовс-стиля стало обычным окном.
+    fn draw_terminal_window(&mut self, ctx: &egui::Context) {
+        let mut submit = false;
+        self.windows.terminal.show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .id_source("ai_chat_scroll")
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.ai_text_area)
+                            .font(egui::FontId::monospace(11.0))
+                            .text_color(egui::Color32::WHITE)
+                            .desired_width(f32::INFINITY)
+                            .lock_focus(true),
+                    );
+                });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let input_field = ui.add(
+                    egui::TextEdit::singleline(&mut self.user_input)
+                        .id(egui::Id::new(INPUT_FIELD_ID))
+                        .desired_width(ui.available_width() - 70.0)
+                        .hint_text("/help, /apps или запрос к ИИ..."),
+                );
+                // Просьба от иконки/Enter на столе: поле уже нарисовано — фокусуем.
+                if self.focus_input_pending {
+                    input_field.request_focus();
+                    self.focus_input_pending = false;
+                }
+
+                // История команд: ↑/↓ перебирают прошлые запросы. TextEdit в
+                // singleline-режиме эти стрелки не использует, поэтому забираем их себе.
+                if input_field.has_focus() {
+                    let dir = ui.input(|i| {
+                        if i.key_pressed(egui::Key::ArrowUp) { Some(-1i32) }
+                        else if i.key_pressed(egui::Key::ArrowDown) { Some(1i32) }
+                        else { None }
+                    });
+                    if let Some(dir) = dir {
+                        walk_history(
+                            &self.cmd_history,
+                            &mut self.cmd_hist_pos,
+                            &mut self.user_input,
+                            dir,
+                            ui.ctx(),
+                        );
+                    }
+                }
+
+                if (input_field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                    || ui.button("EXEC").clicked()
+                {
+                    submit = true;
+                }
+            });
+        });
+        if submit {
+            self.push_history(&self.user_input.clone());
+            // send_ai_query сам чистит поле, эхо-строку пишет в чат и решает,
+            // слеш-команда это или запрос к модели.
+            self.send_ai_query();
+        }
+    }
+
+    /// 📊 Окно «Монитор системы»: график CPU, память, диск и статус бэкенда.
+    /// Виджеты жили прямо на столе — с оконным хромом они стали приложением
+    /// «Монитор», как диспетчер задач в Windows.
+    fn draw_monitor_window(&mut self, ctx: &egui::Context) {
+        self.windows.monitor.show(ctx, |ui| {
+            // Сэмпл телеметрии — раз за кадр окна (как раньше раз за кадр стола).
+            let mut ram_text = String::new();
+            let mut disk_text = String::new();
+            let mut ram_percent = 0.0f32;
+            if let Ok(metrics) = self.metrics_link.lock() {
+                self.cpu_history.pop_front();
+                self.cpu_history.push_back(metrics.current_cpu_load);
+                ram_percent = metrics.current_ram_percent;
+                ram_text = metrics.ram_info_text.clone();
+                disk_text = metrics.disk_info_text.clone();
+            }
+            let w = ui.available_width();
+
+            // — График CPU: код перенесён из бывшего draw_chrome стола,
+            //   координаты теперь относительные (окно может менять размер) —
+            ui.label(egui::RichText::new("CPU LOAD").monospace().size(11.0));
+            // allocate_space возвращает (Id, Response) — прямоугольник берём у Response.
+            let rect = ui.allocate_space(egui::vec2(w, 110.0)).1;
+            let painter = ui.painter();
+            painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(24, 24, 28));
+            painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(50, 50, 56)));
+            if self.cpu_history.len() > 1 {
+                let plot_bottom = rect.max.y - 16.0;
+                let scale = (rect.height() - 30.0).max(20.0) / 100.0;
+                let steps = self.cpu_history.len().saturating_sub(1).max(1) as f32;
+                let step_x = (w - 24.0) / steps;
+                let line = egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 60, 60));
+                for i in 0..self.cpu_history.len() - 1 {
+                    let x1 = rect.min.x + 12.0 + (i as f32 * step_x);
+                    let y1 = plot_bottom - (self.cpu_history[i] * scale);
+                    let x2 = rect.min.x + 12.0 + ((i + 1) as f32 * step_x);
+                    let y2 = plot_bottom - (self.cpu_history[i + 1] * scale);
+                    painter.line_segment([egui::pos2(x1, y1), egui::pos2(x2, y2)], line);
+                }
+            }
+            painter.text(
+                egui::pos2(rect.min.x + 12.0, rect.max.y - 8.0),
+                egui::Align2::LEFT_CENTER,
+                format!("CURRENT_LOAD: {:.1}%", self.cpu_history.back().copied().unwrap_or(0.0)),
+                egui::FontId::monospace(9.0),
+                egui::Color32::from_rgb(130, 130, 135),
+            );
+            ui.add_space(8.0);
+
+            // — Память: строка + полоса —
+            ui.label(egui::RichText::new(ram_text).monospace().size(11.0));
+            ui.add(
+                egui::ProgressBar::new(ram_percent / 100.0)
+                    .desired_width(w)
+                    .fill(egui::Color32::from_rgb(255, 60, 60)),
+            );
+            ui.add_space(8.0);
+
+            // — Диск —
+            ui.label(egui::RichText::new(disk_text).monospace().size(11.0));
+            ui.add_space(10.0);
+
+            // — Статус бэкенда ИИ —
+            let online = self.backend_alive.load(Ordering::Relaxed);
+            let (txt, col) = if online {
+                (
+                    format!("AI CORE: ONLINE — {} @ {}", self.ai_model_name, self.ai_endpoint),
+                    egui::Color32::from_rgb(80, 220, 120),
+                )
+            } else {
+                (
+                    format!("AI CORE: OFFLINE — {}", self.ai_endpoint),
+                    egui::Color32::from_rgb(255, 80, 80),
+                )
+            };
+            ui.colored_label(col, egui::RichText::new(txt).monospace().size(10.0));
+        });
+    }
+
+    /// Запомнить команду перед отправкой. Пустые строки не храним, повтор
+    /// последней команды не дублируем.
+    fn push_history(&mut self, cmd: &str) {
+        let cmd = cmd.trim();
+        if cmd.is_empty() { return; }
+        if self.cmd_history.last().map(String::as_str) != Some(cmd) {
+            self.cmd_history.push(cmd.to_string());
+            if self.cmd_history.len() > 50 { self.cmd_history.remove(0); }
+        }
+        self.cmd_hist_pos = None;
+    }
 
     /// 📝 Окно Блокнота (Notes Workspace)
     fn draw_notes_window(&mut self, ctx: &egui::Context) {
@@ -500,7 +837,7 @@ impl VanguardOSApp {
             ui.small("Дообучение идёт на Ваших собственных диалогах из терминала.\nБаза не изменяется: адаптеры копятся в trainer/runs/.");
         });
         if want_refresh {
-            self.trainer_count = crate::shell::count_dialogue_lines();
+            self.trainer_count = vanguard_os_lib::core::shell::count_dialogue_lines();
         }
         if want_start {
             self.start_trainer();
@@ -566,7 +903,11 @@ impl VanguardOSApp {
     }
 
     /// 🚀 Окно Лаунчера / Реестра ИИ-софта: список с кнопкой немедленного запуска.
-    fn draw_apps_window(&mut self, ctx: &egui::Context) {
+    /// Запуск возвращается наружу (как в проводнике): замыкание show() занято
+    /// borrow'ом self.windows.apps, а /run теперь исполняется через try_core_run,
+    /// которому нужно &mut self целиком.
+    fn draw_apps_window(&mut self, ctx: &egui::Context) -> Option<String> {
+        let mut launch_id: Option<String> = None;
         self.windows.apps.show(ctx, |ui| {
             ui.vertical_centered(|ui| { ui.heading("CHOOSE APPLICATION TO RUN:"); ui.add_space(5.0); });
             let mut files = Vec::new();
@@ -580,12 +921,13 @@ impl VanguardOSApp {
             egui::ScrollArea::vertical().id_source("registry_scroll").show(ui, |ui| {
                 for path in files {
                     let id = script_id_from_path(&path.to_string_lossy()).unwrap_or_else(|| "???".to_string());
-                    let btn = ui.add(egui::Button::new(format!("🚀 LAUNCH: vanguard_gen_{}.py", id)).fill(egui::Color32::from_rgb(16, 16, 16)).stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0, 255, 66))));
-                    if btn.clicked() { let _ = self.shell.handle_command(&format!("/run {}", id)); }
+                    let btn = ui.add(egui::Button::new(format!("▶ LAUNCH: vanguard_gen_{}.py", id)).fill(egui::Color32::from_rgb(16, 16, 16)).stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(0, 255, 66))));
+                    if btn.clicked() { launch_id = Some(id); }
                     ui.add_space(4.0);
                 }
             });
         });
+        launch_id
     }
 
     /// 🗂 Окно проводника скриптов: список vanguard_gen_*.py слева, их код справа.
@@ -694,8 +1036,12 @@ impl VanguardOSApp {
 
         self.user_input.clear();
 
-        // Команда уходит в шелл; не-AI ветки (вывод текста, выход) исполняет
-        // apply_shell_command — та же логика, что для контекстного меню и проводника.
+        // `/run` уходит в ядро (фон + лог токеном), остальное — локальный шелл;
+        // не-AI ветки (вывод текста, выход) исполняет apply_shell_command —
+        // та же логика, что для контекстного меню и проводника.
+        if self.try_core_run(&query) {
+            return;
+        }
         let action = self.shell.handle_command(&query);
         match action {
             ShellAction::AiStreamAllowed => {
@@ -711,7 +1057,7 @@ impl VanguardOSApp {
 
                 // Характер Ви захардкожен: поля personality в приложении нет,
                 // телеметрия в него не пишет, поэтому шлём фиксированный набор.
-                let current_personality = crate::ai_core::DronePersonality {
+                let current_personality = vanguard_os_lib::ai_core::DronePersonality {
                     loyalty: 1.0,       // Максимальная верность системе
                     irritability: 0.1,  // Минимальная раздражительность на старте
                     energy: 1.0,        // Полный заряд батареи/энергии ядра
@@ -722,7 +1068,7 @@ impl VanguardOSApp {
                 // с предыдущими репликами. Ответ добавляется в check_ai_stream по Finished.
                 self.shell.ai_core.push_user(&query);
                 // События уходят в канал, чат читает их в check_ai_stream.
-                crate::ai_core::spawn_ai_request(
+                vanguard_os_lib::ai_core::spawn_ai_request(
                     query,
                     self.shell.ai_core.messages.clone(),
                     current_personality,
@@ -766,14 +1112,63 @@ impl VanguardOSApp {
                     if let Some(marker) = self.ai_stream_marker.take() {
                         self.ai_text_area.truncate(marker);
                     }
-                    // Результат содержит сам ответ ИИ (или лог создания скрипта) —
-                    // раньше он отбрасывался и в чате не появлялось ничего.
+                    // Компиляция Rust (`rustc -O`, секунды) — единственная операция,
+                    // которая реально замораживает рендер, поэтому едет в ядро.
+                    // Истории сразу отдаём заглушку: результат придёт позже
+                    // ActionOutput-ом, а писать финальный ответ в разгар нового
+                    // запроса нельзя — маркер бы его перетёр.
+                    if let VanguardAction::CreateScript { language, code, description } = &action {
+                        if language.eq_ignore_ascii_case("rust") {
+                            let gen_id: u32 = rand::thread_rng().gen_range(100..1000);
+                            let ack = format!(
+                                ">> [ИИ] {}\n>> Компиляция Rust ушла в ядро (vanguard_core), ждём...\n",
+                                description
+                            );
+                            self.shell.ai_core.push_assistant(&ack);
+                            self.ai_text_area.push_str(&ack);
+
+                            let tx = self.ai_event_tx.clone();
+                            let bg = Arc::clone(&self.shell.bg_tasks);
+                            bg.fetch_add(1, Ordering::SeqCst);
+                            // Клонируем до spawn: замыкание уходит в 'static-поток,
+                            // а code/description — ссылки на локальный action.
+                            let code = code.clone();
+                            let description = description.clone();
+                            std::thread::spawn(move || {
+                                let request = serde_json::to_string(&Request::CompileRust {
+                                    code,
+                                    description,
+                                    gen_id,
+                                })
+                                .unwrap_or_default();
+                                let reply = crate::ipc_client::call(&request);
+                                let _ = tx.send(AiEvent::ActionOutput(reply.text));
+                                bg.fetch_sub(1, Ordering::SeqCst);
+                            });
+                            continue;
+                        }
+                    }
+                    // Остальное (текст, python/bash, системные команды) — локально:
+                    // это не тяжело, выносить в ядро незачем. Результат содержит сам
+                    // ответ ИИ (или лог создания скрипта).
                     let output = self.shell.execute_ai_action(action);
                     // Ответ уходит и в историю диалога: без него контекст состоял бы
                     // из одных вопросов, и модель не помнила бы, что сама ответила.
                     self.shell.ai_core.push_assistant(&output);
                     self.ai_text_area.push_str(&output);
                 }
+
+                // Результат тяжёлой операции из ядра (компиляция Rust). В историю он
+                // не идёт — там уже лежит заглушка из ExecuteAction; в чат дописываем,
+                // а если пользователь уже начал новый ответ ИИ — вставляем ПЕРЕД его
+                // превью (по маркеру), иначе следующий Delta перетёр бы результат.
+                AiEvent::ActionOutput(text) => match self.ai_stream_marker {
+                    Some(marker) => {
+                        self.ai_text_area.insert_str(marker, &text);
+                        self.ai_stream_marker = Some(marker + text.len());
+                    }
+                    None => self.ai_text_area.push_str(&text),
+                },
 
                 // Генерация завершена: маркер снимается, терминал разблокируется,
                 // а если в чате остался python-код — он сохраняется на диск.
@@ -844,8 +1239,11 @@ impl eframe::App for VanguardOSApp {
         // 🧹 Окно Очистителя логов и кэша VRAM
         self.draw_cleaner_window(ctx);
 
-        // 🚀 Окно Лаунчера / Реестра ИИ-софта
-        self.draw_apps_window(ctx);
+        // 🚀 Окно Лаунчера / Реестра ИИ-софта: LAUNCH возвращается наружу и
+        // исполняется после show() — /run уйдёт в ядро через try_core_run.
+        if let Some(id) = self.draw_apps_window(ctx) {
+            self.run_shell_command(&format!("/run {}", id));
+        }
 
         // 🗂 Окно проводника скриптов: список vanguard_gen_*.py слева, их код справа.
         // Запуск возвращается наружу: run_shell_command берёт &mut self целиком,
@@ -856,6 +1254,12 @@ impl eframe::App for VanguardOSApp {
 
         // 🧬 Окно самообучения: журнал своих диалогов → QLoRA-дообучение модели.
         self.draw_trainer_window(ctx);
+
+        // 🧠 ИИ-терминал и 📊 Монитор системы — появились с переходом на оконный
+        // хром Windows 11: терминал больше не врезан в стол, а монитор заменил
+        // виджеты, раньше висевшие прямо на обоях.
+        self.draw_terminal_window(ctx);
+        self.draw_monitor_window(ctx);
 
         // 📝 Автосохранение блокнота: пишем только когда текст менялся. На каждый
         // символ — лишняя запись, а полагаться на on_exit нельзя: выход через /exit —
@@ -877,24 +1281,24 @@ impl eframe::App for VanguardOSApp {
                 ctx.request_repaint();
                 self.draw_boot_screen(ui.painter());
             } else {
-                // Стол целиком живёт в desktop.rs: фоновая сетка, верхняя строка, виджеты,
-                // иконки, контекстное меню, панель задач, область вывода и строка ввода.
-                // Он не владеет ни окнами, ни шеллом, ни чатом — берёт к ним доступ через
-                // DesktopHost (набор заимствований на один кадр) и возвращает намерения,
-                // которые мы исполняем ниже. Так раскладка не тянет за собой &mut self.
+                // Стол целиком живёт в desktop.rs: обои, иконки, контекстное меню,
+                // центрированная панель задач и меню «Пуск». Он не владеет ни окнами,
+                // ни шеллом, ни чатом — берёт к ним доступ через DesktopHost (набор
+                // заимствований на один кадр) и возвращает намерения, которые мы
+                // исполняем ниже. Так раскладка не тянет за собой &mut self.
+                // Меню «Пуск» показывает свежие скрипты: перечисляем их только пока
+                // меню открыто, чтобы не гонять glob каждый кадр.
+                if self.desktop.start_open {
+                    self.recent_scripts = recent_scripts_scan();
+                }
                 let mut host = DesktopHost {
                     win_w: self.win_w,
                     win_h: self.win_h,
-                    metrics: &self.metrics_link,
-                    cpu_history: &mut self.cpu_history,
+                    windows: &mut self.windows,
                     backend_online: self.backend_alive.load(Ordering::Relaxed),
-                    ai_model: &self.ai_model_name,
-                    ai_endpoint: &self.ai_endpoint,
                     is_ai_streaming: self.is_ai_streaming,
                     bg_tasks: self.shell.bg_tasks.load(Ordering::Relaxed),
-                    windows: &mut self.windows,
-                    ai_text_area: &mut self.ai_text_area,
-                    user_input: &mut self.user_input,
+                    recent_scripts: &self.recent_scripts,
                 };
                 let intents = self.desktop.draw(ui, ctx, &mut host);
                 // host держит заимствования полей self — отпускаем их до &mut self ниже.
