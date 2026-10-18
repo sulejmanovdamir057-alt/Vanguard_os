@@ -135,7 +135,8 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
 - `src/ipc.rs` — the IPC protocol and nothing else: `Request`/`Response`/`Event` enums
   (serde, `tag = "cmd"`/`"kind"`, `snake_case`) plus `CORE_PORT` (7331) and `core_addr()`.
   Single source of truth for the wire format. Add a request here first, then a handler in
-  `bin/core.rs`, then a caller.
+  `bin/core.rs`, then a caller. The `Fs*` requests (file explorer) also carry their payload
+  types here (`FsEntry`/`FsListing`/`FsFile`) — see the sandbox section below.
 - `src/ai_core.rs` — `spawn_ai_request`: env config, SSE streaming reader, `extract_preview`,
   plus the `VanguardAction` JSON protocol. Non-2xx does not reach here as an error (the agent
   is built with `http_status_as_error(false)`), the status is checked before parsing. Lives in
@@ -154,7 +155,8 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
 - `src/bin/core.rs` — `vanguard_core` main: binds `127.0.0.1:7331`, one thread per connection,
   each with its own `VanguardShell` (independent dialogue history). Maps `Request` → work:
   `Shell` → `dispatch_shell`, `RunScript`/`CompileRust` → background thread streaming
-  `Event::TaskLog` back over the same socket, the rest synchronously. `send()` swallows write
+  `Event::TaskLog` back over the same socket, the rest synchronously — including all six `Fs*`
+  handlers, which run inside `sandbox_path()` (see the sandbox section). `send()` swallows write
   errors on purpose — a client that disconnected mid-stream must not panic the core.
 - `src/main.rs` — `vanguard_os` main: spawns the shell's telemetry daemon, then
   `eframe::run_native`. `#![windows_subsystem = "windows"]`, prints nothing to stdout.
@@ -162,19 +164,24 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
   (grouped in `VanguardWindows`), the AI stream, the IPC client calls, and the command input
   entrypoint (`send_ai_query`). The desktop itself was extracted to `desktop.rs`; `app.rs` only
   builds a `DesktopHost` each frame and executes the returned `DesktopIntent`s via
-  `apply_desktop_intent`.
+  `apply_desktop_intent`. It also holds `FsExplorer` (state of the "Файлы" window) and its
+  IPC helpers `fs_call`/`fs_reload`/`fs_open_file`/`fs_save` — free functions, not methods,
+  because the window calls them from inside `show()` where `&mut self` is already taken by
+  the window itself (same trick as `walk_history`).
 - `src/ipc_client.rs` — the shell's side of IPC: `call()` connects, autostarts `vanguard_core.exe`
   if nothing is listening (3 s of retries, spawned with `CREATE_NO_WINDOW`), sends one request,
   and reads responses **until a final `Ok`/`Err`/`Pong`** — see the warning below.
-- `src/desktop.rs` — the whole desktop surface: background grid, top bar, widgets, icon grid,
-  context menu, taskbar, AI output area and the input line. It **owns no windows, shell or
-  chat**: it reaches them through `DesktopHost` (a struct of borrows for one frame) and
-  returns `Vec<DesktopIntent>` for `app.rs` to run. Geometry is hardcoded here, not in
-  `app.rs`.
+- `src/desktop.rs` — the whole desktop surface: wallpaper, icon grid, context menu, taskbar,
+  Start menu and the clock/calendar popup. It **owns no windows, shell or chat**: it reaches
+  them through `DesktopHost` (a struct of borrows for one frame) and returns
+  `Vec<DesktopIntent>` for `app.rs` to run. Its geometry is drawn against the real viewport
+  (see "Desktop layout and widgets" below), never against a constant.
 - `src/ui_window.rs` — thin `VanguardWindow` wrapper over `egui::Window`; carries `minimized`,
   which egui has no native concept of (`show()` just returns early). Also holds
-  `WindowId` (the window enum) and `VanguardWindows`, which groups all five windows so the
-  taskbar can enumerate them via `WindowId::ALL`.
+  `WindowId` (the window enum) and `VanguardWindows`, which groups all ten windows so the
+  taskbar can enumerate them via `WindowId::ALL`. Adding a window touches **seven** places:
+  the enum, `ALL`, `glyph()`, `label()`, the struct, `new()`, `get()` and `get_mut()` — the
+  last two are match arms, so a missed one is a compile error, not a silent ghost.
 - `trainer/vanguard_train.py` — QLoRA self-finetune on the app's own dialogues; launched by
   the Neural Trainer window (`app.rs::start_trainer`) through `python`, logs stream to the GUI
   chat line by line exactly like `/run` does.
@@ -204,53 +211,58 @@ Two more invariants:
 
 ## Desktop layout and widgets
 
-The desktop geometry lives in **one place**: the `Layout` struct in `desktop.rs`, computed each
-frame from the actual window size (`Layout::new(w, h)` in `Desktop::draw`). `draw_chrome`,
-`draw_icons` and `draw_chat_and_input` take that `&Layout` and paint/input against it — there are
-no free-floating coordinates left in those methods. The old "hardcoded 1024×768" map became the
-**reference values** that `Layout::new` must reproduce at 1024×768:
+Geometry is drawn against the **real viewport**, read every frame at the top of
+`app.rs::update()` from `ctx.screen_rect()` — not from a constant. That is the whole reason
+the desktop survives maximize, resize and F11: the taskbar, Start menu and clock popup all
+take `DesktopHost::win_w`/`win_h`, and that pair *is* this rect. 1024×768 stays the
+**reference size** (`app::BASE_W`/`BASE_H`, the same numbers `with_inner_size` gets in
+`main.rs`); the boot logo center is scaled proportionally from `BASE_CX`/`BASE_CY` (512/284),
+so at the reference size nothing moved when this became dynamic. **A regression check is
+therefore still 1024×768**: if the taskbar or the boot screen shifts at that size, the
+scaling drifted.
 
-| region | x | y (at 1024×768) | adapts by |
-|---|---|---|---|
-| top bar (title, clock, backend status) | 0..w | 0..45 | was always relative to `w` |
-| CPU graph | 40..340 | 80..80+graph_h | height clamps 100..200, absorbs all slack |
-| RAM widget | 40..340 | graph+15 | flows after the graph |
-| Disk widget | 40..340 | ram+95 | flows after RAM |
-| icon grid (2 columns, 148×40 each) | 40..190 / 190..340 | disk+15.. | row pitch clamps 44..60 from leftover height |
-| AI terminal frame | 370..w-40 | 80..h-100 | relative to `w`/`h`, as before |
-| input line | 370..w-40 | h-85..h-45 | relative to `h`, left edge = `term_x` |
-| taskbar | 0..w | h-40..h | relative to `h`, as before |
+What reads which size:
 
-How the column flows (`Layout::new`): widgets are **top-anchored** at `y=80`; the CPU graph is the
-only element that **shrinks** (it absorbs everything left after RAM + Disk + nominal 3×60 icon
-grid, clamped to 100..200 px), and the icon **row pitch** re-compresses to fit above the taskbar.
-At 768 the math yields exactly the old table (graph 200, RAM 295, Disk 390, icons 465, pitch 60) —
-so 1024×768 is a regression test: if those values change, the refactor drifted. Below ~445 px of
-height the clamps bottom out and things start to overlap; that is accepted degradation for a
-window no real desktop ever has.
+| element | source |
+|---|---|
+| wallpaper, grid, watermark | `ui.max_rect()` in `draw_wallpaper` |
+| icon grid (number of rows) | `ui.max_rect().height()` in `draw_icons` |
+| taskbar, Start menu, clock popup | `DesktopHost::win_w` / `win_h` |
+| maximized `VanguardWindow` | `ctx.screen_rect()` in `ui_window.rs::show` |
+| first-open position of a window | `default_pos` scaled from the 1024×768 reference, then clamped inside the screen |
+| boot logo / progress bar | `cx`/`cy` = viewport × (512/1024, 284/768) |
 
-The icons used to be a single column at `x 40..160, y 330..610`, which is exactly where RAM and
-Disk were — since icons are painted *after* the widgets they covered both of them and ate the
-clicks aimed at them. `DesktopIcon` no longer carries `x`/`y` at all; `default_icons()` declares
-only `label`/`hint`/`action` and `draw_icons` places them by index (`col = i % 2`, `row = i / 2`).
-**If you move a widget or the icon grid, re-check this table** — and re-check it *at 1024×768*,
-because that is the size every number above was measured against.
+F11 toggles borderless fullscreen via `ViewportCommand::Fullscreen(bool)`. The flag is read
+back from `i.viewport().fullscreen`, **never kept in app state** — Windows can leave fullscreen
+on its own and a local flag would then lie. The window is resizable with
+`min_inner_size = 1024×768`, so it cannot be shrunk below the size every constant above was
+measured against.
+
+`DesktopIcon` carries no `x`/`y` at all: `default_icons()` declares only `glyph`/`label`/
+`hint`/`action`, and `draw_icons` places them by index. Adding an app means adding a
+`WindowId`, one entry in `WindowId::ALL`, one `DesktopIcon` — and nothing else.
 
 Widgets and features added on top of the original desktop:
 
-- **Backend status** (top bar, right, second line): model + `host:port` + ONLINE/OFFLINE, drawn
-  in `desktop.rs::draw_chrome`. The online flag is an `Arc<AtomicBool>` written by a **detached probe
+- **Backend status** (taskbar, right, a single tray dot before the clock): green = Ollama answers,
+  red = nothing on the endpoint. The flag is an `Arc<AtomicBool>` written by a **detached probe
   thread** started in `VanguardOSApp::new`, which does a TCP connect to the endpoint every 2 s.
   Probing inside `update()` would stall the frame on DNS + connect — do not "simplify" it away.
-  The model/endpoint strings come from `ai_core::configured_model()` / `configured_url()`, which
-  are also what `spawn_ai_request` uses; go through those instead of re-reading env, or the UI
-  and the request can drift apart. `app.rs` reads the `AtomicBool` once per frame into
-  `DesktopHost::backend_online`; the desktop never touches atomics itself.
-- **Taskbar** (`desktop.rs::draw_taskbar`): buttons for every `is_open` window, toggling
-  `VanguardWindow::minimized`; right side shows `bg_tasks` and the streaming state. It enumerates
-  windows through `WindowId::ALL` in `ui_window.rs` — **add a window there and to the
-  `VanguardWindows` struct together**, otherwise it silently never appears. Clicks come back as
-  `DesktopIntent::ToggleWindowMinimized` and are applied in `app.rs`.
+  The probe target comes from `ai_core::configured_url()`, which is also what
+  `spawn_ai_request` uses; go through it instead of re-reading env, or the dot and the actual
+  request can drift apart. `app.rs` reads the `AtomicBool` once per frame into
+  `DesktopHost::backend_online`; the desktop never touches atomics itself. The full
+  `model @ host:port` string lives in the Settings window, not on the taskbar.
+- **Taskbar** (`desktop.rs::draw_taskbar`): one pinned-style button for **every** window in
+  `WindowId::ALL` (open or not — closed ones show no status pill), plus Start, clock, tray dots and
+  the show-desktop strip; right side shows `bg_tasks` and the streaming state. It enumerates windows
+  through `WindowId::ALL` in `ui_window.rs` — **add a window there and to the `VanguardWindows`
+  struct together**, otherwise it silently never appears. Clicks come back as
+  `DesktopIntent::ToggleWindowMinimized` and are applied in `app.rs::apply_desktop_intent`, which is
+  **also where a closed window gets opened** (Windows-11 behaviour): the intent only says "toggle",
+  so if `is_open` were not checked there, clicking any of the nine closed apps would silently flip
+  `minimized` and do nothing — that bug shipped once already. A freshly opened Terminal additionally
+  gets `focus_input_pending`.
 - **Context menu** (right-click anywhere on the desktop): opens by storing the cursor position in
   `Desktop::menu_pos`; closes on a menu item, on Esc, or on `Response::clicked_elsewhere()`, which
   reacts to **primary clicks only** — a right-click relocates the menu instead of closing it.
@@ -268,6 +280,16 @@ Widgets and features added on top of the original desktop:
   by the marker rewrite. The explorer's own state (`explorer_sel`/`explorer_code`/
   `explorer_status`) still lives on `VanguardOSApp`, not on `Desktop` — it is window state,
   not desktop surface.
+- **File Explorer** (`self.windows.explorer`, «Файлы»): a real directory tree served by the core
+  over IPC — **the shell never touches the filesystem here** (no `std::fs` anywhere in
+  `draw_fs_window`). Its state is one `FsExplorer` struct on `VanguardOSApp`, and its IPC helpers
+  `fs_call`/`fs_reload`/`fs_leave`/`fs_up`/`fs_enter`/`fs_open_file`/`fs_save` are **free functions,
+  not methods** — the same trick as `walk_history`: they run inside `VanguardWindow::show`'s
+  closure, where `&mut self` is already taken by the window itself, and only `self.fs` is
+  additionally captured (disjoint field capture, edition 2021). Requests are issued **inside** the
+  closure for the same reason. List/read/write happen **only on a click**, never per frame, or every
+  frame would pay for a TCP round trip. First open (and every re-open, tracked by `fs.loaded`,
+  reset while the window is closed) issues exactly one `FsList`.
 
 ## Runtime file side effects — run the app from the repo root
 
@@ -282,6 +304,8 @@ the split there are **two processes with two CWDs**:
   (`cargo run --bin vanguard_core` from `src/`, say), its CWD differs and `/run` will report
   "file not found" for scripts the shell can clearly see. **Start the core from the repo root**
   (or let the shell spawn it) — that is the whole reason `cargo run` alone is enough.
+  The same CWD is the **sandbox root** of the file explorer (see the sandbox section): a core
+  started from `src/` would show `src/`'s children as the whole "computer".
 
 Generated artifacts, all relative to the *core's* CWD: `vanguard_gen_<id>.py`,
 `vanguard_tmp_<id>.rs`, `vanguard_app_<id>.exe`, `vanguard_script_<id>.bat|.sh`.
@@ -311,6 +335,36 @@ down, and both must stay in sync if you change compile flags).
 
 Slash-commands: `/help /apps /run <id> /hardware /wipe /reset /exit`. Anything else that does not
 start with `/` is sent to the LLM.
+
+## File explorer «Файлы» — the core sandbox (added 2026-10-14)
+
+Six requests in `src/ipc.rs` (`FsList`/`FsRead`/`FsWrite`/`FsMkdir`/`FsRename`/`FsDelete`) and their
+handlers in `src/bin/core.rs`. Every path a client sends is **relative to the sandbox root** — the
+empty string means the root itself — and every one of them goes through
+`core.rs::sandbox_path(root, rel)` before it may touch disk.
+
+| rule | why it exists |
+|---|---|
+| the root is `canonicalize(env::current_dir())` once at core startup | it is the core's CWD, so it agrees with `/run`'s relative paths; canonicalizing once means `starts_with` compares against a real path |
+| `..` and `:` are rejected **as text, before** `canonicalize()` | otherwise a path could leave and come back through a junction, and a check after the fact would be formal |
+| the longest existing prefix is canonicalized, missing components re-appended | `canonicalize()` needs an existing path; `mkdir -p` and "new file" create two new levels at once. A not-yet-existing component cannot be a symlink, so trusting it is safe |
+| comparison is `starts_with(root)`, component-wise | `C:\vanguard_os_evil` must not count as a child of `C:\vanguard_os` |
+| the root itself may be listed and read but **not** deleted or renamed | `sandbox_path("")` legally returns the root; `remove_dir_all` there would take the whole project |
+| files over 1 MiB and non-UTF-8 files are refused by `FsRead` | the shell keeps the text in memory and repaints it every frame |
+
+`fs_pretty()` strips Windows' `\\?\` verbatim prefix for **display only** (the path bar would
+otherwise read `\\?\C:\Users\...`); never compare against the pretty string.
+
+Payload types (`FsEntry`/`FsListing`/`FsFile`) live in `ipc.rs`, not in `core.rs`, because the
+shell deserializes them in `app.rs` — putting them anywhere else would break the "one source of
+truth" rule the same file already states for the wire format. Note `FsListing.entries` arrives
+**pre-sorted** (directories first, then case-insensitive name); the GUI must not re-sort.
+
+Smoke test: `%TEMP%\opencode\fs_smoke.ps1` (ASCII-only — PS 5.1 chokes on Cyrillic in a `.ps1`
+here) starts a fresh `vanguard_core.exe` over 8.3 short paths, drives all six requests over raw
+TCP and parses both JSON levels of `Response::Ok`. It asserts behaviour, not message text — the
+error strings are Russian, so substring matching on them is unreliable. 32 checks, last run
+2026-10-14, all passing.
 
 ## Self-finetune loop — Neural Trainer window (added 2026-10-12)
 
