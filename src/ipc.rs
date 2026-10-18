@@ -23,6 +23,35 @@ pub const CORE_PORT: u16 = 7331;
 /// (например, для отладки ядра на другой машине — но IPC принципиально локальный).
 pub const CORE_ADDR: &str = "127.0.0.1";
 
+/// Запись проводника: имя элемента, директория ли это и размер в байтах.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// Список одной директории песочницы. Возвращается в тексте [`Response::Ok`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsListing {
+    /// Запрошенный каталог, приведённый к общему виду: слэши `/`, без ведущего.
+    pub path: String,
+    /// Абсолютный корень песочницы — оболочка показывает его в строке пути,
+    /// сама до файлов не дотрагивается.
+    pub root: String,
+    /// Директории первыми, внутри — по алфавиту: так ядро гарантирует порядок,
+    /// оболочке сортировать нечего.
+    pub entries: Vec<FsEntry>,
+}
+
+/// Содержимое открытого файла. Пути в песочнице хранятся относительно корня
+/// и через `/` — формат протокола, а не ОС.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FsFile {
+    pub path: String,
+    pub content: String,
+}
+
 /// Запрос к ядру. Одна строка JSON на соединение.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -52,6 +81,23 @@ pub enum Request {
     ListScripts,
     /// Счётчик реплик в журнале диалогов (окно Neural Trainer).
     DialogueCount,
+    // ── Проводник «Файлы» ──
+    // Все пути — относительно корня песочницы ядра, пустая строка = сам корень.
+    // Ядро проверяет каждый путь (`canonicalize()` + `starts_with(root)`), так
+    // что оболочка не может прочитать или уничтожить ничего за его пределами.
+
+    /// Список директории. Ответ — JSON [`FsListing`].
+    FsList { path: String },
+    /// Содержимое UTF-8 файла. Ответ — JSON [`FsFile`].
+    FsRead { path: String },
+    /// Записать файл: создать или перезаписать целиком.
+    FsWrite { path: String, content: String },
+    /// Создать директорию вместе со всеми родителями.
+    FsMkdir { path: String },
+    /// Переименовать или переместить файл/директорию внутри песочницы.
+    FsRename { from: String, to: String },
+    /// Удалить файл, пустую директорию или дерево целиком.
+    FsDelete { path: String },
     /// Пустой heartbeat: ядро живо, если отвечает `{"kind":"ok"}`.
     Ping,
 }
