@@ -7,7 +7,7 @@
 //! (`VanguardOSApp::apply_desktop_intent`). Благодаря этому раскладка не тянет
 //! за собой `&mut self` и не дерётся с borrow-checker'ом.
 
-use chrono::Local;
+use chrono::{Datelike, Local, NaiveDate};
 use eframe::egui;
 
 use crate::ui_window::{VanguardWindows, WindowId, TASKBAR_H};
@@ -20,6 +20,24 @@ pub const INPUT_FIELD_ID: &str = "ai_input_field";
 fn hover_bg() -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
 }
+
+/// Месяцы для заголовка календаря (именительный: «Октябрь 2026»).
+const MONTHS_RU: [&str; 12] = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь",
+    "Ноябрь", "Декабрь",
+];
+
+/// Те же месяцы в родительном падеже — для строки полной даты («13 октября 2026»).
+/// Русский требует двух форм, поэтому массивов два, а не один.
+const MONTHS_RU_GEN: [&str; 12] = [
+    "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября",
+    "октября", "ноября", "декабря",
+];
+
+/// Полные названия дней недели, индекс = `weekday().num_days_from_monday()` (пн = 0).
+const WEEKDAYS_RU_FULL: [&str; 7] = [
+    "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье",
+];
 
 /// Иконка рабочего стола. Позицию в сетке считает `draw_icons` от размера
 /// окна — здесь только то, что объявляет автор иконки.
@@ -60,6 +78,9 @@ pub enum DesktopIntent {
 /// Всё, что столу нужно от приложения. Живёт ровно один кадр, собирается
 /// в `update()` из полей `VanguardOSApp`.
 pub struct DesktopHost<'a> {
+    /// Реальный размер вьюпорта в этом кадру — берётся из `ctx.screen_rect()`
+    /// в `update()`, а не из константы: в развёрнутом/полноэкранном окне
+    /// панель задач, меню «Пуск» и календарь должны тянуться на весь экран.
     pub win_w: f32,
     pub win_h: f32,
     /// Окна целиком: панель задач, «Пуск» и иконки обращаются через `WindowId`.
@@ -84,6 +105,12 @@ pub struct Desktop {
     pub start_query: String,
     /// Выбранная (одиночный клик) иконка; двойной клик по ней открывает приложение.
     pub selected_icon: Option<usize>,
+    /// Календарь над часами в трее открыт.
+    pub clock_open: bool,
+    /// Год и месяц, которые листает пользователь. Сбрасываются на текущие
+    /// при каждом открытии — календарь начинается с «сегодня», как в Windows.
+    clock_year: i32,
+    clock_month: u32,
 }
 
 impl Default for Desktop {
@@ -94,12 +121,16 @@ impl Default for Desktop {
 
 impl Desktop {
     pub fn new() -> Self {
+        let now = Local::now();
         Self {
             icons: default_icons(),
             menu_pos: None,
             start_open: false,
             start_query: String::new(),
             selected_icon: None,
+            clock_open: false,
+            clock_year: now.year(),
+            clock_month: now.month(),
         }
     }
 
@@ -110,8 +141,11 @@ impl Desktop {
         self.draw_wallpaper(ui);
         self.draw_icons(ui, &mut intents);
         self.draw_context_menu(ctx, &mut intents);
-        let start_clicked = self.draw_taskbar(ui, host, &mut intents);
+        // «Пуск» и календарь взаимоисключающиы: клик по одному закрывает другой,
+        // поэтому клики возвращаются наружу и гасятся внутри соответствующих методов.
+        let (start_clicked, clock_clicked) = self.draw_taskbar(ui, host, &mut intents);
         self.draw_start_menu(ctx, host, &mut intents, start_clicked);
+        self.draw_clock_popup(ctx, host, clock_clicked);
         intents
     }
 
@@ -319,9 +353,9 @@ impl Desktop {
 
     /// Панель задач Windows 11: кнопка «Пуск» и закреплённые приложения — по
     /// центру, часы и индикаторы — справа, тонкая полоска «Свернуть все» у
-    /// самого края. Возвращает true, если в этом кадре кликнули «Пуск» —
-    /// меню использует это, чтобы не закрыться от собственного открытия.
-    fn draw_taskbar(&mut self, ui: &egui::Ui, host: &DesktopHost, intents: &mut Vec<DesktopIntent>) -> bool {
+    /// самого края. Возвращает `(клик по «Пуску», клик по часам)` — оба меню
+    /// используют это, чтобы не закрыться от собственного открытия.
+    fn draw_taskbar(&mut self, ui: &egui::Ui, host: &DesktopHost, intents: &mut Vec<DesktopIntent>) -> (bool, bool) {
         let painter = ui.painter();
         let tb_y = host.win_h - TASKBAR_H;
         let tb_rect = egui::Rect::from_min_max(egui::pos2(0.0, tb_y), egui::pos2(host.win_w, host.win_h));
@@ -349,6 +383,8 @@ impl Desktop {
             self.start_open = !self.start_open;
             self.start_query.clear();
             start_clicked = true;
+            // «Пуск» и календарь не живут одновременно — как в Windows.
+            self.clock_open = false;
         }
         start_resp.on_hover_text("Пуск");
         cx += BTN;
@@ -396,7 +432,22 @@ impl Desktop {
         }
         painter.text(egui::pos2(rx, tb_y + 16.0), egui::Align2::RIGHT_CENTER, time_s, egui::FontId::proportional(12.0), egui::Color32::WHITE);
         painter.text(egui::pos2(rx, tb_y + 33.0), egui::Align2::RIGHT_CENTER, date_s, egui::FontId::proportional(10.0), egui::Color32::from_rgb(180, 180, 185));
+        // Клик по часам открывает/закрывает календарь. `on_hover_text` потребляет
+        // Response, поэтому клик читаем заранее — тот же приём, что у кнопок
+        // приложений и полоски «Свернуть все».
+        let clock_clicked = clock_resp.clicked();
         clock_resp.on_hover_text(now.format("%A, %d %B %Y").to_string());
+        if clock_clicked {
+            self.clock_open = !self.clock_open;
+            if self.clock_open {
+                // Листание всегда начинается с текущего месяца.
+                let n = Local::now();
+                self.clock_year = n.year();
+                self.clock_month = n.month();
+            }
+            self.start_open = false;
+            self.start_query.clear();
+        }
         rx -= 86.0;
 
         // Индикаторы: состояние ИИ и фоновые задачи (как «иконки трея»).
@@ -442,7 +493,7 @@ impl Desktop {
             intents.push(DesktopIntent::MinimizeAll);
         }
 
-        start_clicked
+        (start_clicked, clock_clicked)
     }
 
     /// Меню «Пуск» по центру над панелью задач: поиск, закреплённые приложения
@@ -452,7 +503,10 @@ impl Desktop {
             return;
         }
         const MENU_W: f32 = 560.0;
-        const MENU_H: f32 = 470.0;
+        // Не «высота окна», а отступ от низа: Area ресайзится под контент сам.
+        // 9 плиток = 3 ряда (было 8 и 2), то есть +70 px контента — запас ниже
+        // иначе съедался бы панелью задач.
+        const MENU_H: f32 = 510.0;
         let x = ((host.win_w - MENU_W) / 2.0).max(8.0);
         let y = (host.win_h - TASKBAR_H - MENU_H - 10.0).max(8.0);
 
@@ -565,6 +619,188 @@ impl Desktop {
             self.start_query.clear();
         }
     }
+
+    /// Часы в трее: клик открывает календарь месяца с текущим временем над
+    /// панелью задач, прижатый вправо — как в Windows 11.
+    ///
+    /// Расположение, закрытие по клику мимо и по Esc — тот же паттерн, что у
+    /// меню «Пуск», включая защиту через `clock_clicked`: без неё
+    /// `clicked_elsewhere()` закрыл бы календарь тем же кликом, что его открыл.
+    fn draw_clock_popup(&mut self, ctx: &egui::Context, host: &DesktopHost, clock_clicked: bool) {
+        if !self.clock_open {
+            return;
+        }
+        const W: f32 = 300.0;
+        // Не высота окна (Area ресайзится под контент сама), а отступ от низа:
+        // сколько места отвести сверху, чтобы низ оказался над панелью задач.
+        const H: f32 = 320.0;
+        let x = (host.win_w - W - 12.0).max(8.0);
+        let y = (host.win_h - TASKBAR_H - H - 8.0).max(8.0);
+
+        let mut close = false;
+        let menu = egui::Area::new(egui::Id::new("clock_popup"))
+            .fixed_pos(egui::pos2(x, y))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgb(43, 43, 49))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 70, 78)))
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(14.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(W - 28.0);
+                        ui.set_max_width(W - 28.0);
+
+                        // ── Текущее время. Секунды идут сами: update() держит
+                        // кадр живым раз в секунду, пока стол открыт. ──
+                        let now = Local::now();
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(now.format("%H:%M:%S").to_string())
+                                    .size(34.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{}, {} {} {}",
+                                    WEEKDAYS_RU_FULL[now.weekday().num_days_from_monday() as usize],
+                                    now.day(),
+                                    MONTHS_RU_GEN[(now.month() - 1) as usize],
+                                    now.year()
+                                ))
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(180, 180, 185)),
+                            );
+                        });
+                        ui.add_space(10.0);
+
+                        // ── Заголовок месяца с листанием по краям ──
+                        ui.horizontal(|ui| {
+                            if ui.button("‹").clicked() {
+                                self.step_clock_month(-1);
+                            }
+                            ui.with_layout(
+                                egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} {}",
+                                            MONTHS_RU[(self.clock_month - 1) as usize],
+                                            self.clock_year
+                                        ))
+                                        .strong()
+                                        .size(13.0),
+                                    );
+                                },
+                            );
+                            if ui.button("›").clicked() {
+                                self.step_clock_month(1);
+                            }
+                        });
+                        ui.add_space(6.0);
+
+                        self.draw_month_grid(ui, &now);
+                    });
+            });
+
+        if menu.response.clicked_elsewhere() && !clock_clicked {
+            close = true;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !clock_clicked {
+            close = true;
+        }
+        if close {
+            self.clock_open = false;
+        }
+    }
+
+    /// Листание календаря на месяц; перенос года через январь/декабрь.
+    fn step_clock_month(&mut self, delta: i32) {
+        let mut m = self.clock_month as i32 + delta;
+        let mut y = self.clock_year;
+        if m < 1 {
+            m = 12;
+            y -= 1;
+        } else if m > 12 {
+            m = 1;
+            y += 1;
+        }
+        self.clock_month = m as u32;
+        self.clock_year = y;
+    }
+
+    /// Сетка месяца: строка названий дней недели (пн = 1, русская неделя) и
+    /// числа. Сегодняшнее — акцентной «таблеткой», суббота/воскресенье — красные.
+    /// Чистая графика: дни по клику ничего не делают, событий в системе нет.
+    fn draw_month_grid(&self, ui: &mut egui::Ui, today: &chrono::DateTime<Local>) {
+        const WEEKDAYS: [&str; 7] = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+
+        let (y, m) = (self.clock_year, self.clock_month);
+        let days: u32 = match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            // Високосное правило считаем сами: короче и нагляднее, чем две
+            // даты через вычитание, и совпадает с NaiveDate по определению.
+            2 => {
+                if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 30,
+        };
+        // Сколько пустых клеток перед первым числом: пн = 0 … вс = 6.
+        let lead: u32 = NaiveDate::from_ymd_opt(y, m, 1)
+            .map(|d| d.weekday().number_from_monday() - 1)
+            .unwrap_or(0);
+
+        let avail_w = ui.available_width();
+        let cell_w = avail_w / 7.0;
+        let cell_h = 26.0;
+        // Один блок painter'ом, а не 42 отдельных виджета: дни и так
+        // некликабельны, а хитрый hit-test им только мешал бы.
+        let (_, rect) = ui.allocate_space(egui::vec2(avail_w, cell_h * 7.0));
+        let p = ui.painter();
+
+        for (i, wd) in WEEKDAYS.iter().enumerate() {
+            let r = egui::Rect::from_min_size(
+                rect.min + egui::vec2(i as f32 * cell_w, 0.0),
+                egui::vec2(cell_w, cell_h),
+            );
+            let c = if i >= 5 {
+                egui::Color32::from_rgb(255, 120, 120)
+            } else {
+                egui::Color32::from_rgb(150, 150, 155)
+            };
+            p.text(r.center(), egui::Align2::CENTER_CENTER, *wd, egui::FontId::proportional(11.0), c);
+        }
+
+        for d in 1..=days {
+            let idx = lead + d - 1;
+            let (col, row) = (idx % 7, idx / 7);
+            let cell = egui::Rect::from_min_size(
+                rect.min + egui::vec2(col as f32 * cell_w, (row + 1) as f32 * cell_h),
+                egui::vec2(cell_w, cell_h),
+            );
+            let is_today = today.year() == y && today.month() == m && today.day() == d;
+            if is_today {
+                p.rect_filled(
+                    egui::Rect::from_center_size(cell.center(), egui::vec2(cell_w - 6.0, cell_h - 6.0)),
+                    6.0,
+                    egui::Color32::from_rgb(0, 120, 212),
+                );
+            }
+            let c = if is_today {
+                egui::Color32::WHITE
+            } else if col >= 5 {
+                egui::Color32::from_rgb(255, 130, 130)
+            } else {
+                egui::Color32::from_rgb(225, 225, 230)
+            };
+            p.text(cell.center(), egui::Align2::CENTER_CENTER, d.to_string(), egui::FontId::proportional(12.0), c);
+        }
+    }
 }
 
 /// Плитка приложения в меню «Пуск»: глиф + имя, подсветка при наведении.
@@ -639,10 +875,22 @@ fn default_icons() -> Vec<DesktopIcon> {
             action: IconAction::OpenWindow(WindowId::Scripts),
         },
         DesktopIcon {
+            glyph: WindowId::Explorer.glyph(),
+            label: WindowId::Explorer.label(),
+            hint: "Файловый проводник с песочницей ядра",
+            action: IconAction::OpenWindow(WindowId::Explorer),
+        },
+        DesktopIcon {
             glyph: WindowId::Trainer.glyph(),
             label: WindowId::Trainer.label(),
             hint: "QLoRA-самообучение модели",
             action: IconAction::OpenWindow(WindowId::Trainer),
+        },
+        DesktopIcon {
+            glyph: WindowId::Settings.glyph(),
+            label: WindowId::Settings.label(),
+            hint: "Бэкенд ИИ и автозапуск Ollama",
+            action: IconAction::OpenWindow(WindowId::Settings),
         },
     ]
 }

@@ -61,12 +61,26 @@ impl VanguardWindow {
         // позицию окна через память egui.
         let area_id = egui::Id::new(("vwin", self.title.clone()));
 
+        // Позиция появления считается от реального экрана: `new()` задаёт
+        // случайную точку в опорных 1024×768, а окно может быть развёрнутым
+        // или уведённым в полный экран (F11) — тогда константа увала бы в угол.
+        // egui читает default_pos только при первом показе, дальше Area помнит
+        // свою позицию, так что масштаб не дёргает уже открытые окна. Считаем
+        // здесь, а не в конструкторе: там экрана ещё не существует.
+        let screen = ctx.screen_rect();
+        let default_pos = egui::pos2(
+            (self.default_pos.x * screen.width() / crate::app::BASE_W)
+                .clamp(8.0, (screen.width() - self.default_size.x - 8.0).max(8.0)),
+            (self.default_pos.y * screen.height() / crate::app::BASE_H)
+                .clamp(8.0, (screen.height() - TASKBAR_H - self.default_size.y - 8.0).max(8.0)),
+        );
+
         let mut window = egui::Window::new("")
             .id(area_id)
             .title_bar(false) // весь хром рисуем сами
             .resizable(true)
             .collapsible(false)
-            .default_pos(self.default_pos)
+            .default_pos(default_pos)
             .default_size(self.default_size)
             .frame(
                 egui::Frame::none()
@@ -220,12 +234,14 @@ pub enum WindowId {
     Cleaner,
     Apps,
     Scripts,
+    Explorer,
     Trainer,
+    Settings,
 }
 
 impl WindowId {
     /// Порядок здесь задаёт порядок кнопок на панели задач и в меню «Пуск».
-    pub const ALL: [WindowId; 8] = [
+    pub const ALL: [WindowId; 10] = [
         WindowId::Terminal,
         WindowId::Monitor,
         WindowId::Notes,
@@ -233,7 +249,9 @@ impl WindowId {
         WindowId::Cleaner,
         WindowId::Apps,
         WindowId::Scripts,
+        WindowId::Explorer,
         WindowId::Trainer,
+        WindowId::Settings,
     ];
 
     /// Глиф-иконка для панели задач / «Пуска» / стола (единый источник).
@@ -249,7 +267,13 @@ impl WindowId {
             WindowId::Cleaner => "⌫",
             WindowId::Apps => "▶",
             WindowId::Scripts => "≡",
+            // «▦» занята Монитором; ▣ (U+25A3) — «заполненный файл», сосед
+            // ▦ по таблице, гарантированно есть в Segoe UI Symbol.
+            WindowId::Explorer => "▣",
             WindowId::Trainer => "⚙",
+            // «⚙» уже занята Тренером; ◈ (U+25C8) — сосед ◉, гарантированно
+            // есть в Segoe UI Symbol, который подгружается в app.rs.
+            WindowId::Settings => "◈",
         }
     }
 
@@ -263,7 +287,9 @@ impl WindowId {
             WindowId::Cleaner => "Очистка",
             WindowId::Apps => "Лаунчер",
             WindowId::Scripts => "Скрипты",
+            WindowId::Explorer => "Файлы",
             WindowId::Trainer => "Тренер",
+            WindowId::Settings => "Настройки",
         }
     }
 }
@@ -278,7 +304,9 @@ pub struct VanguardWindows {
     pub cleaner: VanguardWindow,
     pub apps: VanguardWindow,
     pub scripts: VanguardWindow,
+    pub explorer: VanguardWindow,
     pub trainer: VanguardWindow,
+    pub settings: VanguardWindow,
 }
 
 impl VanguardWindows {
@@ -291,7 +319,11 @@ impl VanguardWindows {
             cleaner: VanguardWindow::new("Core Cleaner v1.1", 400.0, 250.0),
             apps: VanguardWindow::new("Vanguard App Registry", 450.0, 300.0),
             scripts: VanguardWindow::new("Script Explorer", 620.0, 420.0),
+            // Проводник шире «Скриптов»: у него ещё и строка пути, и панель
+            // действий, и редактор справа.
+            explorer: VanguardWindow::new("Vanguard Explorer", 760.0, 470.0),
             trainer: VanguardWindow::new("Neural Trainer v0.1", 420.0, 340.0),
+            settings: VanguardWindow::new("Vanguard Settings", 520.0, 430.0),
         }
     }
 
@@ -313,7 +345,9 @@ impl VanguardWindows {
             WindowId::Cleaner => &mut self.cleaner,
             WindowId::Apps => &mut self.apps,
             WindowId::Scripts => &mut self.scripts,
+            WindowId::Explorer => &mut self.explorer,
             WindowId::Trainer => &mut self.trainer,
+            WindowId::Settings => &mut self.settings,
         }
     }
 
@@ -328,7 +362,9 @@ impl VanguardWindows {
             WindowId::Cleaner => &self.cleaner,
             WindowId::Apps => &self.apps,
             WindowId::Scripts => &self.scripts,
+            WindowId::Explorer => &self.explorer,
             WindowId::Trainer => &self.trainer,
+            WindowId::Settings => &self.settings,
         }
     }
 }

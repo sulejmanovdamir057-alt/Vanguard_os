@@ -18,6 +18,7 @@ mod app;
 mod desktop;
 mod ui_window;
 mod ipc_client;
+mod settings;
 
 use app::VanguardOSApp;
 
@@ -32,8 +33,12 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1024.0, 768.0])
-            .with_resizable(false)
+            // 1024×768 — опорный размер раскладки (см. app::BASE_*), но не
+            // потолок: update() каждый кадр читает реальный вьюпорт, поэтому
+            // окно можно тянуть, разворачивать и уводить в F11-полный экран.
+            .with_inner_size([app::BASE_W, app::BASE_H])
+            .with_min_inner_size([app::BASE_W, app::BASE_H])
+            .with_resizable(true)
             .with_decorations(true)
             .with_maximized(true)
             .with_title("Vanguard Sovereign OS — Terminal Link"),

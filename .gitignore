@@ -14,6 +14,10 @@ vanguard_script_*.sh
 # Заметки блокнота: приложение пишет их сюда при каждом изменении текста.
 vanguard_notes.txt
 
+# Настройки окна «Настройки» (src/settings.rs): модель, reasoning_effort,
+# keep_alive, автозапуск Ollama. Личная конфигурация машины, не исходник.
+vanguard_settings.json
+
 # Журнал диалогов для самообучения (пишет shell.rs, читает trainer/vanguard_train.py).
 # Это личная переписка пользователя с моделью — в git не попадает по определению.
 vanguard_dialogues.jsonl

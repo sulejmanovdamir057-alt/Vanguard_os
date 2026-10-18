@@ -13,8 +13,9 @@ use rand::Rng;
 use vanguard_os_lib::ai_core::{AiEvent, VanguardAction, configured_model, configured_url};
 use vanguard_os_lib::core::telemetry::SystemMetrics;
 use vanguard_os_lib::core::shell::{script_id_from_path, ShellAction, VanguardShell};
-use vanguard_os_lib::ipc::Request;
+use vanguard_os_lib::ipc::{FsEntry, FsFile, FsListing, Request};
 use crate::desktop::{Desktop, DesktopHost, DesktopIntent, INPUT_FIELD_ID};
+use crate::settings::{self, AppSettings};
 use crate::ui_window::{VanguardWindows, WindowId};
 
 
@@ -95,8 +96,184 @@ pub(crate) fn endpoint_host_port(url: &str) -> (String, u16) {
     (authority.to_string(), 80)
 }
 
+/// Опорные размеры окна и центр заставки — те же числа, что уходят в
+/// `ViewportBuilder::with_inner_size` (см. `main.rs`). Стол больше не привязан
+/// к ним: он берёт реальный вьюпорт каждый кадр, а отсюда считаются пропорции
+/// логотипа. На 1024×768 всё стоит ровно там же, что и до адаптивной
+/// раскладки — это и есть опорная точка для всех констант раскладки.
+pub const BASE_W: f32 = 1024.0;
+pub const BASE_H: f32 = 768.0;
+const BASE_CX: f32 = 512.0;
+const BASE_CY: f32 = 284.0;
+
+// ─── Проводник «Файлы» ──────────────────────────────────────────────────────
+
+/// Состояние окна «Файлы».
+///
+/// Оболочка сама к диску не тянется: всё делает ядро внутри своей песочницы
+/// (корень = рабочий каталог ядра, проверка пути — `sandbox_path` в
+/// `bin/core.rs`). Здесь лежит только последний ответ `FsList` и открытый в
+/// редакторе файл — поэтому `draw_fs_window` не делает ни одного `std::fs`.
+#[derive(Default)]
+struct FsExplorer {
+    /// Текущий каталог относительно корня песочницы, слэши `/` ("" = корень).
+    path: String,
+    /// Абсолютный корень песочницы — из первого ответа, для строки пути.
+    root: String,
+    /// Последний список от ядра: порядок уже приведён к «каталоги первыми».
+    entries: Vec<FsEntry>,
+    /// Выбранная запись — имя внутри текущего каталога.
+    sel: Option<String>,
+    /// Открытый файл: его относительный путь и содержимое в редакторе.
+    file: String,
+    code: String,
+    /// В редакторе есть правки, которых ещё нет на диске.
+    dirty: bool,
+    /// Строка ввода для «создать» / «переименовать» и статусная строка.
+    input: String,
+    status: String,
+    /// Последняя операция закончилась ошибкой — статус красим в красный.
+    failed: bool,
+    /// Список уже запрашивался хотя бы раз: иначе при мёртвом ядре окно
+    /// стучалось бы заново на каждой рамке и клало рендер на 3 с ожидания.
+    loaded: bool,
+}
+
+/// Склеивает каталог и имя элемента в путь протокола: слэши `/`, без ведущего.
+/// Ядро приведёт его к абсолютному и проверит, что тот внутри песочницы.
+fn fs_join(dir: &str, name: &str) -> String {
+    let dir = dir.trim_matches('/');
+    let name = name.trim_matches('/');
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}/{}", dir, name)
+    }
+}
+
+/// Родительский каталог: `"src/core"` → `"src"`, `"src"` → `""`.
+fn fs_parent(dir: &str) -> String {
+    let dir = dir.trim_matches('/');
+    match dir.rfind('/') {
+        Some(i) => dir[..i].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Один IPC-вызов к ядру и разбор JSON-ответа. Полезная нагрузка едет в тексте
+/// `Ok` — так устроен весь протокол, — поэтому и ошибка, и битый ответ
+/// сводятся к одной строке, которую показывает статусная строка окна.
+fn fs_call<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, String> {
+    let json = serde_json::to_string(&req)
+        .map_err(|e| format!("не удалось сериализовать запрос: {}", e))?;
+    let reply = crate::ipc_client::call(&json);
+    if !reply.ok {
+        return Err(reply.text.trim().to_string());
+    }
+    serde_json::from_str::<T>(&reply.text).map_err(|e| format!("ядро ответило не тем: {}", e))
+}
+
+/// Перечитывает текущий каталог у ядра.
+///
+/// Отдельная функция, а не метод `VanguardOSApp` — тот же приём, что у
+/// `walk_history`: окно вызывает её внутри `show()`, где `&mut self` целиком
+/// уже занят отрисовкой самого окна, а заимствуется тут только `FsExplorer`.
+fn fs_reload(fs: &mut FsExplorer) {
+    match fs_call::<FsListing>(Request::FsList { path: fs.path.clone() }) {
+        Ok(list) => {
+            fs.root = list.root;
+            fs.entries = list.entries;
+            fs.status = format!("{} объектов", fs.entries.len());
+            fs.failed = false;
+        }
+        Err(e) => {
+            fs.entries.clear();
+            fs.status = e;
+            fs.failed = true;
+        }
+    }
+}
+
+/// Уход из каталога или на другой файл. Если в редакторе несохранённые правки,
+/// переход отклоняется — иначе текст потерялся бы молча.
+fn fs_leave(fs: &mut FsExplorer) -> bool {
+    if fs.dirty {
+        fs.status = String::from("Сначала SAVE — иначе правки в редакторе потеряются.");
+        fs.failed = true;
+        return false;
+    }
+    fs.file.clear();
+    fs.code.clear();
+    true
+}
+
+/// Вверх на каталог.
+fn fs_up(fs: &mut FsExplorer) {
+    if !fs_leave(fs) {
+        return;
+    }
+    fs.path = fs_parent(&fs.path);
+    fs.sel = None;
+    fs_reload(fs);
+}
+
+/// Войти в подкаталог.
+fn fs_enter(fs: &mut FsExplorer, dir: &str) {
+    if !fs_leave(fs) {
+        return;
+    }
+    fs.path = fs_join(&fs.path, dir);
+    fs.sel = None;
+    fs_reload(fs);
+}
+
+/// Открыть файл в редакторе.
+fn fs_open_file(fs: &mut FsExplorer, name: &str) {
+    if !fs_leave(fs) {
+        return;
+    }
+    let path = fs_join(&fs.path, name);
+    match fs_call::<FsFile>(Request::FsRead { path }) {
+        Ok(f) => {
+            fs.file = f.path;
+            fs.code = f.content;
+            fs.dirty = false;
+            fs.status = format!("Открыт: {}", fs.file);
+            fs.failed = false;
+        }
+        Err(e) => {
+            fs.status = e;
+            fs.failed = true;
+        }
+    }
+}
+
+/// Записать открытый файл обратно в песочницу.
+fn fs_save(fs: &mut FsExplorer) {
+    if fs.file.is_empty() {
+        fs.status = String::from("Файл не открыт.");
+        fs.failed = true;
+        return;
+    }
+    let path = fs.file.clone();
+    let content = fs.code.clone();
+    match fs_call::<String>(Request::FsWrite { path: path.clone(), content }) {
+        Ok(_) => {
+            fs.dirty = false;
+            fs.status = format!("Сохранено: {}", path);
+            fs.failed = false;
+        }
+        Err(e) => {
+            fs.status = e;
+            fs.failed = true;
+        }
+    }
+}
+
 pub struct VanguardOSApp {
-    /// Геометрия заставки: размеры экрана и центр, от которого рисуется логотип.
+    /// Размер реального вьюпорта (обновляется каждый кадр в `update`) и центр,
+    /// от которого рисуется логотип заставки. Не константы: в развёрнутом и
+    /// полноэкранном окне они должны следовать за экраном.
     win_w: f32,
     win_h: f32,
     cx: f32,
@@ -146,6 +323,10 @@ pub struct VanguardOSApp {
     explorer_sel: Option<String>,
     explorer_code: String,
     explorer_status: String,
+    // 🗂 Проводник «Файлы»: настоящая файловая система через IPC-ядро.
+    // Отдельно от explorer_* выше — те рисуют плоский список vanguard_gen_*.py,
+    // это — каталоги с песочницей и редактором.
+    fs: FsExplorer,
     // 🧬 Самообучение (окно Neural Trainer): HF-модель для дообучения, счётчик
     // реплик в журнале диалогов, текстовый статус и флаг «тренировка идёт».
     trainer_hf_model: String,
@@ -170,6 +351,12 @@ pub struct VanguardOSApp {
     // Кэш конфига бэкенда для статус-строки: env читаем один раз при старте, а не каждый кадр
     ai_model_name: String,
     ai_endpoint: String,
+    // ⚙️ Окно «Настройки»: бэкенд ИИ и автозапуск Ollama. Применение — через env,
+    // см. src/settings.rs: spawn_ai_request читает окружение на каждый запрос.
+    settings: AppSettings,
+    // Строка обратной связи внутри окна (запись файла, запуск демона) — как
+    // explorer_status/trainer_status: писать в чат из окна нельзя, пока идёт стрим.
+    settings_status: String,
     /// События фонового потока ИИ; дренажится каждый кадр в `check_ai_stream`.
     ai_channel_rx: Receiver<AiEvent>,
     /// Пока `true`, новый запрос не принимается (сбрасывается по Finished/Error).
@@ -248,7 +435,7 @@ impl VanguardOSApp {
         let (ai_event_tx, ai_event_rx) = mpsc::channel::<AiEvent>();
 
         let mut app = Self {
-            win_w: 1024.0, win_h: 768.0, cx: 512.0, cy: 284.0,
+            win_w: BASE_W, win_h: BASE_H, cx: BASE_CX, cy: BASE_CY,
             boot_stage: BootStage::BarLoading, progress: 0.0, angle: 0.0,
             user_glitch_trigger: false, particles: Vec::new(),
             current_dx: 0.0, current_dy: 0.0, current_logo_color: egui::Color32::WHITE, is_glitching_now: false,
@@ -265,6 +452,7 @@ impl VanguardOSApp {
             windows: VanguardWindows::new(),
             explorer_sel: None,
             explorer_code: String::new(),
+            fs: FsExplorer::default(),
             explorer_status: String::from("Выберите скрипт из списка слева."),
             // 🧬 Самообучение: модель по умолчанию — та же, что в Ollama, но в
             // формате HuggingFace; переопределяется env VANGUARD_TRAIN_HF_MODEL
@@ -282,6 +470,8 @@ impl VanguardOSApp {
             backend_alive: Arc::new(AtomicBool::new(false)),
             ai_model_name: configured_model(),
             ai_endpoint: configured_url(),
+            settings: AppSettings::load(),
+            settings_status: String::new(),
             // Заметки переживают перезапуск: при отсутствии файла — прежний заголовок.
             notes_text: std::fs::read_to_string(NOTES_FILE)
                 .unwrap_or_else(|_| String::from("# VANGUARD OS USER NOTES\n# Write your code architecture here...\n\n")),
@@ -302,6 +492,24 @@ impl VanguardOSApp {
         // хромом стал обычным приложением. Позиция детерминированная, не случайная.
         app.windows.terminal.is_open = true;
         app.windows.terminal.default_pos = egui::pos2(380.0, 56.0);
+
+        // ⚙️ Настройки вступают в силу до первого запроса ИИ: set_var здесь
+        // достаточен, потому что spawn_ai_request читает env на каждый вызов.
+        // Файл победил env — поэтому и статус-строку бэкенда перечитываем.
+        app.settings.apply_to_env();
+        app.ai_model_name = app.settings.model.clone();
+
+        // 💚 Автозапуск демона Ollama: без него любой запрос ИИ падает с
+        // os error 10061, а Ollama на этой машине не входит в автозагрузку.
+        // Порт проверяем один раз, на старте — это не кадр egui, сеть тут уместна.
+        if app.settings.ollama_autostart && !settings::ollama_listening() {
+            match settings::spawn_ollama() {
+                Ok(()) => app.ai_text_area.push_str(">> OLLAMA: автозапуск демона…\n"),
+                Err(e) => app
+                    .ai_text_area
+                    .push_str(&format!(">> OLLAMA: автозапуск не удался: {}\n", e)),
+            }
+        }
 
         // 💚 Пробник бэкенда ИИ: TCP-коннект к host:port раз в 2 с. Статус-строка стола
         // показывает ONLINE/OFFLINE, поэтому нужен живой признак — но проверять его прямо
@@ -478,8 +686,26 @@ impl VanguardOSApp {
             DesktopIntent::ClearChat => self.clear_chat(),
             DesktopIntent::OpenWindow(id) => self.windows.open(id),
             DesktopIntent::ToggleWindowMinimized(id) => {
-                let w = self.windows.get_mut(id);
-                w.minimized = !w.minimized;
+                // Кнопка панели задач — это и «свернуть/развернуть» открытое
+                // окно, и «запустить» закрытое: раньше здесь переключался
+                // только minimized, поэтому по закрытым приложениям (а это
+                // почти все кнопки) клик не делал ничего вовсе.
+                let just_opened = {
+                    let w = self.windows.get_mut(id);
+                    if w.is_open {
+                        w.minimized = !w.minimized;
+                        false
+                    } else {
+                        w.is_open = true;
+                        w.minimized = false;
+                        true
+                    }
+                };
+                // Запущенный из панели задач терминал получает фокус в строке
+                // ввода — так же, как его иконка на столе и пункт «Пуска».
+                if just_opened && id == WindowId::Terminal {
+                    self.focus_input_pending = true;
+                }
             }
             DesktopIntent::MinimizeAll => {
                 for wid in WindowId::ALL {
@@ -902,6 +1128,130 @@ impl VanguardOSApp {
         });
     }
 
+    /// ⚙️ Окно «Настройки»: бэкенд ИИ (модель, reasoning_effort, keep_alive) и
+    /// автозапуск демона Ollama.
+    ///
+    /// Любая правка сразу кладётся в окружение и в `vanguard_settings.json` —
+    /// отдельной кнопки «Сохранить» нет, как и у блокнота. Всё, что трогается
+    /// внутри замыкания, — только поля `self`: `show()` держит `self.windows.settings`,
+    /// поэтому вызывать отсюда методы `&mut self` нельзя (паттерн окна Тренера).
+    fn draw_settings_window(&mut self, ctx: &egui::Context) {
+        let mut changed = false;
+        let mut want_spawn = false;
+
+        self.windows.settings.show(ctx, |ui| {
+            ui.heading(">> BACKEND & DAEMON SETTINGS");
+            ui.add_space(6.0);
+
+            // Статус-строка: зелёная точка + тот же endpoint, что у пробника бэкенда.
+            let online = self.backend_alive.load(Ordering::Relaxed);
+            ui.horizontal(|ui| {
+                let dot = if online {
+                    egui::Color32::from_rgb(80, 220, 120)
+                } else {
+                    egui::Color32::from_rgb(255, 80, 80)
+                };
+                ui.colored_label(dot, if online { "● ONLINE" } else { "● OFFLINE" });
+                ui.label(egui::RichText::new(self.ai_endpoint.as_str()).monospace().small());
+            });
+            ui.add_space(8.0);
+
+            ui.label("Модель Ollama (тег):");
+            if ui
+                .add(egui::TextEdit::singleline(&mut self.settings.model).desired_width(300.0))
+                .changed()
+            {
+                changed = true;
+            }
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label("reasoning_effort:");
+                egui::ComboBox::from_id_source("settings_effort")
+                    .selected_text(self.settings.reasoning_effort.clone())
+                    .show_ui(ui, |ui| {
+                        for v in ["none", "low", "medium", "high"] {
+                            if ui
+                                .selectable_value(
+                                    &mut self.settings.reasoning_effort,
+                                    v.to_string(),
+                                    v,
+                                )
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+            ui.small(
+                "none — мышление выключено (~1 с). low/medium/high на гибридных моделях\n\
+                 добавляют 10–40 с, а на моделях без thinking Ollama ответит HTTP 400.",
+            );
+            ui.add_space(6.0);
+
+            ui.horizontal(|ui| {
+                ui.label("keep_alive:");
+                if ui
+                    .add(egui::TextEdit::singleline(&mut self.settings.keep_alive).desired_width(120.0))
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.small("-1 = модель не покидает VRAM никогда");
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(6.0);
+
+            // ── Демон ──
+            if online {
+                ui.colored_label(egui::Color32::from_rgb(80, 220, 120), "Ollama уже запущен.");
+            } else if ui.button("▶ ЗАПУСТИТЬ OLLAMA СЕЙЧАС").clicked() {
+                want_spawn = true;
+            }
+            if ui
+                .checkbox(
+                    &mut self.settings.ollama_autostart,
+                    "Поднимать Ollama при старте Vanguard OS",
+                )
+                .changed()
+            {
+                changed = true;
+            }
+            ui.add_space(6.0);
+
+            if !self.settings_status.is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 200, 80),
+                    egui::RichText::new(self.settings_status.as_str()).monospace().small(),
+                );
+            }
+            ui.add_space(4.0);
+            ui.small(
+                "URL и ключ — переменные VANGUARD_AI_URL / VANGUARD_AI_KEY.\n\
+                 Править их из окна нельзя: пробник бэкенда резолвит host:port один раз.",
+            );
+        });
+
+        // Всё, что вышло за рамки замыкания, — здесь: на &mut self целиком.
+        if changed {
+            self.settings.apply_to_env();
+            // Статус-строка стола показывает модель — держим её в актуальном виде.
+            self.ai_model_name = self.settings.model.clone();
+            self.settings_status = match self.settings.save() {
+                Ok(()) => format!("Сохранено в {}", settings::SETTINGS_FILE),
+                Err(e) => format!("Не удалось сохранить: {}", e),
+            };
+        }
+        if want_spawn {
+            self.settings_status = match settings::spawn_ollama() {
+                Ok(()) => String::from("Ollama запускается… статус обновится через ~2 с."),
+                Err(e) => format!("Не удалось запустить Ollama: {}", e),
+            };
+        }
+    }
+
     /// 🚀 Окно Лаунчера / Реестра ИИ-софта: список с кнопкой немедленного запуска.
     /// Запуск возвращается наружу (как в проводнике): замыкание show() занято
     /// borrow'ом self.windows.apps, а /run теперь исполняется через try_core_run,
@@ -993,19 +1343,24 @@ impl VanguardOSApp {
             ui.horizontal(|ui| {
                 // Слева — перечень файлов
                 egui::ScrollArea::vertical().id_source("explorer_list").max_width(190.0).show(ui, |ui| {
-                    for f in &files {
-                        let short = std::path::Path::new(f)
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| f.clone());
-                        let selected = self.explorer_sel.as_deref() == Some(f.as_str());
-                        if ui.selectable_label(selected, short).clicked() {
-                            self.explorer_sel = Some(f.clone());
-                            self.explorer_code = std::fs::read_to_string(f)
-                                .unwrap_or_else(|e| format!("// ошибка чтения {}: {}", f, e));
-                            self.explorer_status = format!("Открыт: {}", f);
+                    // top_down вместо унаследованного left_to_right: имена должны
+                    // идти столбиком, а не одной строкой (подробнее — в
+                    // draw_fs_window, там тот же гнездовой баг был замерен).
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        for f in &files {
+                            let short = std::path::Path::new(f)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| f.clone());
+                            let selected = self.explorer_sel.as_deref() == Some(f.as_str());
+                            if ui.selectable_label(selected, short).clicked() {
+                                self.explorer_sel = Some(f.clone());
+                                self.explorer_code = std::fs::read_to_string(f)
+                                    .unwrap_or_else(|e| format!("// ошибка чтения {}: {}", f, e));
+                                self.explorer_status = format!("Открыт: {}", f);
+                            }
                         }
-                    }
+                    });
                 });
                 ui.separator();
                 // Справа — содержимое выбранного файла
@@ -1017,6 +1372,260 @@ impl VanguardOSApp {
             });
         });
         explorer_run
+    }
+
+    /// Окно «Файлы»: проводник по песочнице ядра. Слева список текущего
+    /// каталога, справа редактор открытого файла. Ни одного обращения к диску
+    /// здесь нет — только IPC, где пути считает и проверяет ядро.
+    ///
+    /// Запросы уходят прямо из замыкания, а не после `show()`: заимствуются
+    /// `self.windows.explorer` и `self.fs` — непересекающиеся поля, поэтому
+    /// borrow-checker это пропускает (то же работает и в `draw_scripts_window`).
+    fn draw_fs_window(&mut self, ctx: &egui::Context) {
+        // Высоты рядов задаются явно — см. развёрнутый комментарий у строки пути.
+        const ROW_H: f32 = 30.0;
+        const PANE_H: f32 = 300.0;
+        if !self.windows.explorer.is_open {
+            // Окно закрыто — сбрасываем флаг: при следующем открытии список
+            // должен перечитаться у ядра, файлы могли измениться извне.
+            self.fs.loaded = false;
+            return;
+        }
+        if !self.fs.loaded {
+            // Первое открытие: список ещё пуст — просим ядро.
+            self.fs.loaded = true;
+            fs_reload(&mut self.fs);
+        }
+
+        self.windows.explorer.show(ctx, |ui| {
+            // ── Строка пути: корень песочницы + текущий относительный путь ──
+            //
+            // Явная высота вместо ui.horizontal(). `horizontal()` — это
+            // left_to_right(Align::Center), и при центрировании по поперечной
+            // оси egui растягивает рамку ряда на всю доступную высоту окна
+            // (layout.rs:611-615). Два таких ряда сверху (путь и кнопки)
+            // съедали всё вертикальное место, и ряду «список + редактор»
+            // доставалось 18 px — из-за чего поле кода обрезалось до 46 px
+            // (замерено датчиком: row size=740x18, а ScrollArea только
+            // благодаря min_scrolled_size раздувался до 64).
+            // Align::Min + фиксированная высота такого не делают.
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), ROW_H), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                if ui.button("↑").on_hover_text("Вверх").clicked() {
+                    fs_up(&mut self.fs);
+                }
+                let shown = if self.fs.path.is_empty() {
+                    self.fs.root.clone()
+                } else {
+                    format!("{}\\{}", self.fs.root, self.fs.path.replace('/', "\\"))
+                };
+                ui.monospace(shown);
+                if ui.button("⟳").on_hover_text("Обновить список").clicked() {
+                    fs_reload(&mut self.fs);
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.colored_label(egui::Color32::from_rgb(130, 130, 135), "двойной клик — открыть");
+                });
+            },
+            );
+
+            // ── Действия: имя берётся из строки ввода, «кто» — из выделения ──
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), ROW_H), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.fs.input)
+                        .hint_text("имя файла или папки")
+                        .desired_width(190.0),
+                );
+                if ui.button("＋ Папка").clicked() {
+                    if self.fs.input.trim().is_empty() {
+                        self.fs.status = String::from("Введите имя папки.");
+                        self.fs.failed = true;
+                    } else {
+                        let path = fs_join(&self.fs.path, self.fs.input.trim());
+                        match fs_call::<String>(Request::FsMkdir { path }) {
+                            Ok(_) => fs_reload(&mut self.fs),
+                            Err(e) => {
+                                self.fs.status = e;
+                                self.fs.failed = true;
+                            }
+                        }
+                    }
+                }
+                if ui.button("＋ Файл").clicked() {
+                    if self.fs.input.trim().is_empty() {
+                        self.fs.status = String::from("Введите имя файла.");
+                        self.fs.failed = true;
+                    } else {
+                        let path = fs_join(&self.fs.path, self.fs.input.trim());
+                        match fs_call::<String>(Request::FsWrite {
+                            path,
+                            content: String::new(),
+                        }) {
+                            Ok(_) => fs_reload(&mut self.fs),
+                            Err(e) => {
+                                self.fs.status = e;
+                                self.fs.failed = true;
+                            }
+                        }
+                    }
+                }
+                ui.separator();
+                // Клонируем имя сразу: ниже идёт `&mut self.fs`, а цикл по
+                // entries держал бы на него заимствование.
+                let sel_name = self.fs.sel.clone();
+                let has_sel = sel_name.is_some();
+                if ui.add_enabled(has_sel, egui::Button::new("→ Переименовать")).clicked() {
+                    // По ссылке: имя нужно ещё ниже, в ветке «Удалить».
+                    if let Some(name) = &sel_name {
+                        if self.fs.input.trim().is_empty() {
+                            self.fs.status = String::from("Введите новое имя.");
+                            self.fs.failed = true;
+                        } else {
+                            let from = fs_join(&self.fs.path, name);
+                            let to = fs_join(&self.fs.path, self.fs.input.trim());
+                            match fs_call::<String>(Request::FsRename { from, to }) {
+                                Ok(_) => {
+                                    self.fs.sel = None;
+                                    fs_reload(&mut self.fs);
+                                }
+                                Err(e) => {
+                                    self.fs.status = e;
+                                    self.fs.failed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("✕ Удалить")).clicked() {
+                    if let Some(name) = sel_name {
+                        let path = fs_join(&self.fs.path, &name);
+                        match fs_call::<String>(Request::FsDelete { path }) {
+                            Ok(_) => {
+                                self.fs.sel = None;
+                                fs_reload(&mut self.fs);
+                            }
+                            Err(e) => {
+                                self.fs.status = e;
+                                self.fs.failed = true;
+                            }
+                        }
+                    }
+                }
+            },
+            );
+            ui.separator();
+
+            // ── Слева список каталога, справа редактор ──
+            //
+            // Обе панели обёрнуты в `with_layout(top_down)`: дочерний ui в egui
+            // наследует раскладку родителя (`child_ui(rect, *ui.layout())`), а
+            // родитель здесь — горизонтальный ряд, то есть `left_to_right`.
+            // Без этого файлы легались бы в одну строку и тянули окно на всю
+            // ширину (замерено на кадре: 1430 px вместо 760). `max_width` не
+            // спасает: он применяется до измерения контента, а при
+            // `auto_shrink[0] = false` итоговая ширина перирается как
+            // `max(доступная, контент)` — то есть контентом.
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), PANE_H), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                egui::ScrollArea::vertical()
+                    .id_source("fs_list")
+                    .max_width(230.0)
+                    .auto_shrink([true, true])
+                    .show(ui, |ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            // Выбранная запись не открывается прямо здесь: заимствование
+                            // entries закончилось бы только с циклом, а fs_enter/
+                            // fs_open_file берут &mut FsExplorer целиком.
+                            let mut enter: Option<String> = None;
+                            let mut open: Option<String> = None;
+                            for e in &self.fs.entries {
+                                let glyph = if e.is_dir { "▸" } else { "·" };
+                                let selected = self.fs.sel.as_deref() == Some(e.name.as_str());
+                                let resp = ui.selectable_label(selected, format!("{} {}", glyph, e.name));
+                                if resp.clicked() {
+                                    self.fs.sel = Some(e.name.clone());
+                                }
+                                if resp.double_clicked() {
+                                    if e.is_dir {
+                                        enter = Some(e.name.clone());
+                                    } else {
+                                        open = Some(e.name.clone());
+                                    }
+                                }
+                            }
+                            if let Some(d) = enter {
+                                fs_enter(&mut self.fs, &d);
+                            }
+                            if let Some(f) = open {
+                                fs_open_file(&mut self.fs, &f);
+                            }
+                        });
+                    });
+
+                ui.separator();
+                // vertical(): длинные строки переносятся, а не скроллятся вбок —
+                // та же схема, что у терминала, которая доказанно держит своё
+                // окно в 600 px. auto_shrink по X выключен, чтобы редактор
+                // занимал весь остаток ряда, а не сжимался под текст.
+                egui::ScrollArea::vertical()
+                    .id_source("fs_code")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.horizontal(|ui| {
+                                let (title, color) = if self.fs.file.is_empty() {
+                                    (
+                                        String::from("— файл не открыт —"),
+                                        egui::Color32::from_rgb(130, 130, 135),
+                                    )
+                                } else if self.fs.dirty {
+                                    (format!("● {} *", self.fs.file), egui::Color32::from_rgb(255, 170, 60))
+                                } else {
+                                    (
+                                        self.fs.file.clone(),
+                                        egui::Color32::from_rgb(130, 130, 135),
+                                    )
+                                };
+                                ui.colored_label(color, title);
+                                if ui
+                                    .add_enabled(!self.fs.file.is_empty(), egui::Button::new("SAVE"))
+                                    .clicked()
+                                {
+                                    fs_save(&mut self.fs);
+                                }
+                            });
+                            // desired_rows — минимум высоты: без него окно
+                            // схлопывалось бы до пары строк, когда в каталоге
+                            // два файла, и редактором было бы нечем пользоваться.
+                            let editor = ui.add(
+                                egui::TextEdit::multiline(&mut self.fs.code)
+                                    .code_editor()
+                                    .desired_rows(14)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if editor.changed() {
+                                self.fs.dirty = true;
+                            }
+                        });
+                    });
+
+                // Высота ряда задана явно (PANE_H) в allocate_ui_with_layout выше.
+                // Раньше здесь стоял allocate_space(vec2(0.0, 300.0)), который в
+                // left_to_right ставил нулевой прямоугольник на
+                // `widget.max.x + item_spacing`, то есть на 8 px правее края, —
+                // и extend_with_x тянул min_rect на 8 px каждый кадр, из-за чего
+                // окно уезжало на всю ширину экрана (замерено датчиком:
+                // avail_w 740 → 748 → … → 1004).
+            },
+            );
+
+            // ── Статус: зелёный на успехе, красный на ошибке ядра ──
+            ui.separator();
+            let color = if self.fs.failed {
+                egui::Color32::from_rgb(255, 96, 96)
+            } else {
+                egui::Color32::from_rgb(0, 220, 90)
+            };
+            ui.colored_label(color, self.fs.status.as_str());
+        });
     }
 
     /// Очистка чата: сбрасывает буфер вывода и память диалога (как /reset) и снимает
@@ -1205,6 +1814,26 @@ impl VanguardOSApp {
 // =========================================================================
 impl eframe::App for VanguardOSApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Геометрия стола и заставки каждый кадр берётся из реального вьюпорта.
+        // Раньше тут жили константы 1024×768 — и в развёрнутом или полноэкранном
+        // окне панель задач, меню «Пуск» и календарь рисовались бы в углу того
+        // же старого размера. Центр логотипа считаем пропорционально опорным
+        // 512×284, поэтому на 1024×768 заставка не смещается ни на пиксель.
+        let screen = ctx.screen_rect();
+        self.win_w = screen.width();
+        self.win_h = screen.height();
+        self.cx = screen.width() * BASE_CX / BASE_W;
+        self.cy = screen.height() * BASE_CY / BASE_H;
+
+        // F11 — полный экран (borderless на текущем мониторе; egui-winit
+        // превращает флаг в `Fullscreen::Borderless(None)`). Флаг читаем из
+        // вьюпорта, а не храним свой: выйти из фулскрина могут и средства
+        // Windows, и тогда собственный флаг врал бы про состояние окна.
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            let full = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!full));
+        }
+
         self.handle_boot_input(ctx);
         self.step_boot_logic();
         self.check_ai_stream();
@@ -1252,8 +1881,16 @@ impl eframe::App for VanguardOSApp {
             self.run_shell_command(&format!("/run {}", id));
         }
 
+        // 🗂 Окно «Файлы»: настоящий проводник по песочнице ядра. Список и
+        // редактор перечитываются по клику, а не каждый кадр — иначе на каждую
+        // рамку уходил бы IPC-вызов.
+        self.draw_fs_window(ctx);
+
         // 🧬 Окно самообучения: журнал своих диалогов → QLoRA-дообучение модели.
         self.draw_trainer_window(ctx);
+
+        // ⚙️ Окно настроек: бэкенд ИИ и автозапуск демона Ollama.
+        self.draw_settings_window(ctx);
 
         // 🧠 ИИ-терминал и 📊 Монитор системы — появились с переходом на оконный
         // хром Windows 11: терминал больше не врезан в стол, а монитор заменил
