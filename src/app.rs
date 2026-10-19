@@ -1344,8 +1344,7 @@ impl VanguardOSApp {
                 // Слева — перечень файлов
                 egui::ScrollArea::vertical().id_source("explorer_list").max_width(190.0).show(ui, |ui| {
                     // top_down вместо унаследованного left_to_right: имена должны
-                    // идти столбиком, а не одной строкой (подробнее — в
-                    // draw_fs_window, там тот же гнездовой баг был замерен).
+                    // идти столбиком, а не одной строкой (подробнее — в draw_fs_window).
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         for f in &files {
                             let short = std::path::Path::new(f)
@@ -1400,15 +1399,11 @@ impl VanguardOSApp {
         self.windows.explorer.show(ctx, |ui| {
             // ── Строка пути: корень песочницы + текущий относительный путь ──
             //
-            // Явная высота вместо ui.horizontal(). `horizontal()` — это
-            // left_to_right(Align::Center), и при центрировании по поперечной
-            // оси egui растягивает рамку ряда на всю доступную высоту окна
-            // (layout.rs:611-615). Два таких ряда сверху (путь и кнопки)
-            // съедали всё вертикальное место, и ряду «список + редактор»
-            // доставалось 18 px — из-за чего поле кода обрезалось до 46 px
-            // (замерено датчиком: row size=740x18, а ScrollArea только
-            // благодаря min_scrolled_size раздувался до 64).
-            // Align::Min + фиксированная высота такого не делают.
+            // Явная высота вместо ui.horizontal(): тот — left_to_right(Align::Center)
+            // и растягивает рамку ряда на всё окно (layout.rs:611-615), так что два
+            // служебных ряда сверху съедали высоту и поле кода обрезалось до 46 px
+            // (замер: row size=740x18, ScrollArea раздувался до 64 min_scrolled_size).
+            // Align::Min с фиксированной высотой такого не делает.
             ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), ROW_H), egui::Layout::left_to_right(egui::Align::Min), |ui| {
                 if ui.button("↑").on_hover_text("Вверх").clicked() {
                     fs_up(&mut self.fs);
@@ -1456,12 +1451,10 @@ impl VanguardOSApp {
                         self.fs.failed = true;
                     } else {
                         let path = fs_join(&self.fs.path, self.fs.input.trim());
-                        // FsCreate, а не FsWrite с пустым содержимым: тот
-                        // перезаписывает существующий файл целиком, и кнопка
-                        // молча обнуляла файл с уже занятым именем. Ядро
-                        // дополнительно отклоняет занятое имя (`create_new`),
-                        // поэтому устаревший список каталога не превратится
-                        // в потерю данных.
+                        // FsCreate, а не FsWrite с пустым содержимым: тот обнулял
+                        // бы файл с уже занятым именем. Проверка занятости — на
+                        // стороне ядра (`create_new`), а не по нашему списку:
+                        // тот может отставать от диска.
                         match fs_call::<String>(Request::FsCreate { path }) {
                             Ok(_) => fs_reload(&mut self.fs),
                             Err(e) => {
@@ -1519,14 +1512,11 @@ impl VanguardOSApp {
 
             // ── Слева список каталога, справа редактор ──
             //
-            // Обе панели обёрнуты в `with_layout(top_down)`: дочерний ui в egui
-            // наследует раскладку родителя (`child_ui(rect, *ui.layout())`), а
-            // родитель здесь — горизонтальный ряд, то есть `left_to_right`.
-            // Без этого файлы легались бы в одну строку и тянули окно на всю
-            // ширину (замерено на кадре: 1430 px вместо 760). `max_width` не
-            // спасает: он применяется до измерения контента, а при
-            // `auto_shrink[0] = false` итоговая ширина перирается как
-            // `max(доступная, контент)` — то есть контентом.
+            // Обе панели обёрнуты в `with_layout(top_down)`: дочерний ui наследует
+            // раскладку родителя, а родитель — горизонтальный ряд, и имена леглись
+            // бы в одну строку, тянув окно на 1430 px. `max_width` не спасает: он
+            // применяется до измерения контента, а при `auto_shrink[0] = false`
+            // итоговая ширина = max(доступная, контент).
             ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), PANE_H), egui::Layout::left_to_right(egui::Align::Min), |ui| {
                 egui::ScrollArea::vertical()
                     .id_source("fs_list")
@@ -1611,12 +1601,9 @@ impl VanguardOSApp {
                     });
 
                 // Высота ряда задана явно (PANE_H) в allocate_ui_with_layout выше.
-                // Раньше здесь стоял allocate_space(vec2(0.0, 300.0)), который в
-                // left_to_right ставил нулевой прямоугольник на
-                // `widget.max.x + item_spacing`, то есть на 8 px правее края, —
-                // и extend_with_x тянул min_rect на 8 px каждый кадр, из-за чего
-                // окно уезжало на всю ширину экрана (замерено датчиком:
-                // avail_w 740 → 748 → … → 1004).
+                // allocate_space(vec2(0.0, _)) тут был бы ошибкой: в left_to_right
+                // он кладёт нулевой прямоугольник на 8 px правее края, min_rect рос
+                // на 8 px каждый кадр, пока окно не упиралось в экран.
             },
             );
 
