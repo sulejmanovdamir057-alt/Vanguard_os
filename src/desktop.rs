@@ -103,6 +103,9 @@ pub struct Desktop {
     pub start_open: bool,
     /// Строка поиска внутри «Пуска» (фильтрует список закреплённых).
     pub start_query: String,
+    /// Вид внутри «Пуска»: `false` — сетка закреплённых плиток, `true` —
+    /// плоский список «Все приложения». Сбрасывается при закрытии меню.
+    pub start_all_apps: bool,
     /// Выбранная (одиночный клик) иконка; двойной клик по ней открывает приложение.
     pub selected_icon: Option<usize>,
     /// Календарь над часами в трее открыт.
@@ -127,6 +130,7 @@ impl Desktop {
             menu_pos: None,
             start_open: false,
             start_query: String::new(),
+            start_all_apps: false,
             selected_icon: None,
             clock_open: false,
             clock_year: now.year(),
@@ -382,6 +386,7 @@ impl Desktop {
         if start_resp.clicked() {
             self.start_open = !self.start_open;
             self.start_query.clear();
+            self.start_all_apps = false;
             start_clicked = true;
             // «Пуск» и календарь не живут одновременно — как в Windows.
             self.clock_open = false;
@@ -447,6 +452,7 @@ impl Desktop {
             }
             self.start_open = false;
             self.start_query.clear();
+            self.start_all_apps = false;
         }
         rx -= 86.0;
 
@@ -496,112 +502,274 @@ impl Desktop {
         (start_clicked, clock_clicked)
     }
 
-    /// Меню «Пуск» по центру над панелью задач: поиск, закреплённые приложения
-    /// и последние сгенерированные скрипты («Рекомендуется»).
-    fn draw_start_menu(&mut self, ctx: &egui::Context, host: &DesktopHost, intents: &mut Vec<DesktopIntent>, start_clicked: bool) {
+    /// Меню «Пуск» в духе Windows 11: панель на 640 px, прижатая низом к панели
+    /// задач, поиск-пилюля, сетка закреплённых плиток «иконка сверху», раздел
+    /// «Рекомендуется» и футер с пользователем и питанием.
+    ///
+    /// Якорь — `Area::anchor(CENTER_BOTTOM)`, а не вычисленный `fixed_pos`: он
+    /// считается от `ctx.screen_rect()`, то есть от реального вьюпорта, поэтому
+    /// низ меню сам встаёт над панелью задач при любом размере окна и при F11.
+    /// Старая схема (`win_h - TASKBAR_H - MENU_H`) держала высоту контента в
+    /// константе, а при фильтре поиска сетка теряла ряды и меню дёргалось —
+    /// поэтому ниже пустые ряды и пустые ячейки **резервируются** явно.
+    fn draw_start_menu(
+        &mut self,
+        ctx: &egui::Context,
+        host: &DesktopHost,
+        intents: &mut Vec<DesktopIntent>,
+        start_clicked: bool,
+    ) {
         if !self.start_open {
             return;
         }
-        const MENU_W: f32 = 560.0;
-        // Не «высота окна», а отступ от низа: Area ресайзится под контент сам.
-        // 9 плиток = 3 ряда (было 8 и 2), то есть +70 px контента — запас ниже
-        // иначе съедался бы панелью задач.
-        const MENU_H: f32 = 510.0;
-        let x = ((host.win_w - MENU_W) / 2.0).max(8.0);
-        let y = (host.win_h - TASKBAR_H - MENU_H - 10.0).max(8.0);
+        const MENU_W: f32 = 640.0;
+        // Оценка на самый первый кадр: Area ещё не измерила контент и берёт
+        // default_size. Дальше она помнит свой размер сама.
+        const MENU_H: f32 = 520.0;
+        // Скольким над панелью задач — как в Windows, меню почти касается её.
+        const GAP: f32 = 6.0;
+        // Геометрия плиток: 4 колонки, три ряда резервируются всегда.
+        const TILE_H: f32 = 74.0;
+        const TILE_GAP: f32 = 8.0;
+        const GRID_ROWS: usize = 3;
+        // Ячейка «Рекомендуется» и её сетка 2×2 — тоже всегда четыре.
+        const CELL_H: f32 = 26.0;
+        const REC_ROWS: usize = 2;
 
         let mut close = false;
+        let mut open_first = false;
         let menu = egui::Area::new(egui::Id::new("start_menu"))
-            .fixed_pos(egui::pos2(x, y))
             .order(egui::Order::Foreground)
+            .anchor(
+                egui::Align2::CENTER_BOTTOM,
+                egui::vec2(0.0, -(TASKBAR_H + GAP)),
+            )
+            .default_size(egui::vec2(MENU_W, MENU_H))
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style())
-                    .fill(egui::Color32::from_rgb(43, 43, 49))
-                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 70, 78)))
+                    .fill(egui::Color32::from_rgb(36, 36, 40))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 70, 76)))
                     .rounding(egui::Rounding::same(8.0))
                     .inner_margin(16.0)
                     .show(ui, |ui| {
                         ui.set_min_width(MENU_W - 32.0);
                         ui.set_max_width(MENU_W - 32.0);
 
-                        // Поиск (реальный: фильтрует закреплённые приложения).
-                        let search = ui.add(
-                            egui::TextEdit::singleline(&mut self.start_query)
-                                .hint_text("Поиск приложений")
-                                .desired_width(f32::INFINITY),
-                        );
-                        if search.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            // Enter по первому найденному — открыть его.
-                            if let Some(icon) = self.icons.iter().find(|ic| {
-                                ic.label.to_lowercase().contains(&self.start_query.to_lowercase())
-                            }) {
-                                match icon.action {
-                                    IconAction::FocusInput => intents.push(DesktopIntent::FocusInput),
-                                    IconAction::OpenWindow(wid) => intents.push(DesktopIntent::OpenWindow(wid)),
-                                }
+                        // ── Поиск: пилюля с рамкой, как в Windows 11 ──
+                        egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(32, 32, 36))
+                            .stroke(egui::Stroke::new(
+                                1.0_f32,
+                                egui::Color32::from_rgb(72, 72, 80),
+                            ))
+                            .rounding(egui::Rounding::same(6.0))
+                            .inner_margin(10.0_f32)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 6.0;
+                                    ui.label(
+                                        egui::RichText::new("🔍")
+                                            .size(13.0)
+                                            .color(egui::Color32::from_rgb(170, 170, 178)),
+                                    );
+                                    let r = ui.add(
+                                        egui::TextEdit::singleline(&mut self.start_query)
+                                            .hint_text("Поиск: приложения, настройки и документы")
+                                            .frame(false)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    // Enter открывает первое совпадение. Проверяем
+                                    // и has_focus, и lost_focus: однострочный TextEdit
+                                    // не снимает фокус с Enter, так что lost_focus
+                                    // один в этом состоянии никогда не сработал бы.
+                                    if (r.has_focus() || r.lost_focus())
+                                        && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+                                    {
+                                        open_first = true;
+                                    }
+                                });
+                            });
+
+                        if open_first {
+                            let q = self.start_query.to_lowercase();
+                            if let Some(icon) = self
+                                .icons
+                                .iter()
+                                .find(|ic| ic.label.to_lowercase().contains(&q))
+                            {
+                                intents.push(match icon.action {
+                                    IconAction::FocusInput => DesktopIntent::FocusInput,
+                                    IconAction::OpenWindow(wid) => DesktopIntent::OpenWindow(wid),
+                                });
                                 close = true;
                             }
                         }
-                        ui.add_space(12.0);
+                        ui.add_space(14.0);
 
-                        // ── Закреплено: сетка 4 колонки ──
-                        ui.label(egui::RichText::new("Закреплено").size(13.0).strong());
-                        ui.add_space(4.0);
+                        // ── Заголовок: «Закреплено» слева, «Все приложения» справа ──
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Закреплено").size(13.0).strong());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let label = if self.start_all_apps {
+                                        "‹  К закреплённым"
+                                    } else {
+                                        "Все приложения  ›"
+                                    };
+                                    if ui.small_button(label).clicked() {
+                                        self.start_all_apps = !self.start_all_apps;
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(6.0);
+
                         let q = self.start_query.to_lowercase();
-                        let pinned: Vec<WindowId> = WindowId::ALL
-                            .iter()
-                            .copied()
-                            .filter(|wid| q.is_empty() || wid.label().to_lowercase().contains(&q))
-                            .collect();
-                        for chunk in pinned.chunks(4) {
-                            ui.horizontal(|ui| {
-                                for wid in chunk {
-                                    if start_tile(ui, wid.glyph(), wid.label(), ui.make_persistent_id(("start_tile", wid))) {
-                                        match wid {
-                                            // Терминал из «Пуска» — сразу с фокусом в строке ввода.
-                                            WindowId::Terminal => intents.push(DesktopIntent::FocusInput),
-                                            other => intents.push(DesktopIntent::OpenWindow(*other)),
+                        if self.start_all_apps {
+                            // ── Все приложения: один колонкой список, без буквенных
+                            // разделителей — высота фиксирована прокруткой, чтобы
+                            // якорь меню не дёргался при вводе в поиске. ──
+                            let mut all: Vec<WindowId> = WindowId::ALL
+                                .iter()
+                                .copied()
+                                .filter(|w| q.is_empty() || w.label().to_lowercase().contains(&q))
+                                .collect();
+                            all.sort_by_key(|w| w.label().to_lowercase());
+                            egui::ScrollArea::vertical()
+                                .id_source("start_all_apps")
+                                .max_height((TILE_H + TILE_GAP) * GRID_ROWS as f32 - TILE_GAP)
+                                .auto_shrink([true, false])
+                                .show(ui, |ui| {
+                                    ui.with_layout(
+                                        egui::Layout::top_down(egui::Align::Min),
+                                        |ui| {
+                                            for wid in all {
+                                                if start_app_row(ui, wid, CELL_H) {
+                                                    intents.push(open_intent(wid));
+                                                    close = true;
+                                                }
+                                            }
+                                        },
+                                    );
+                                });
+                        } else {
+                            // ── Закреплено: сетка 4 колонки, «иконка сверху» ──
+                            let pinned: Vec<WindowId> = WindowId::ALL
+                                .iter()
+                                .copied()
+                                .filter(|w| q.is_empty() || w.label().to_lowercase().contains(&q))
+                                .collect();
+                            let cw = ((ui.available_width() - TILE_GAP * 3.0) / 4.0).max(90.0);
+                            let mut used = 0usize;
+                            for chunk in pinned.chunks(4) {
+                                used += 1;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = TILE_GAP;
+                                    for wid in chunk {
+                                        let id =
+                                            ui.make_persistent_id(("start_tile", *wid));
+                                        if start_tile(ui, wid.glyph(), wid.label(), id, cw, TILE_H)
+                                        {
+                                            intents.push(open_intent(*wid));
+                                            close = true;
                                         }
-                                        close = true;
+                                    }
+                                });
+                            }
+                            // Пустые ряды: без них высота меню падала бы при
+                            // вводе в поиске (два совпавших = один ряд вместо трёх),
+                            // и панель прыгала бы вверх-вниз.
+                            let rest = GRID_ROWS.saturating_sub(used);
+                            if rest > 0 {
+                                ui.add_space(rest as f32 * (TILE_H + TILE_GAP));
+                            }
+                        }
+
+                        ui.add_space(14.0);
+
+                        // ── Рекомендуется: сетка 2×2, пустые ячейки заняты
+                        // подсказкой/просто местом — высота не зависит от того,
+                        // сколько скриптов уже сгенерировано. ──
+                        ui.label(egui::RichText::new("Рекомендуется").size(13.0).strong());
+                        ui.add_space(6.0);
+                        let cell_w = (ui.available_width() - TILE_GAP) / 2.0;
+                        for row in 0..REC_ROWS {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = TILE_GAP;
+                                for col in 0..2 {
+                                    let i = row * 2 + col;
+                                    match host.recent_scripts.get(i) {
+                                        Some((id, name)) => {
+                                            let btn = ui.add_sized(
+                                                [cell_w, CELL_H],
+                                                egui::Button::new(
+                                                    egui::RichText::new(format!("▸  {}", name))
+                                                        .size(11.0),
+                                                )
+                                                .frame(false),
+                                            );
+                                            if btn.clicked() {
+                                                intents.push(DesktopIntent::RunCommand(
+                                                    format!("/run {}", id),
+                                                ));
+                                                close = true;
+                                            }
+                                        }
+                                        // Пустая ячейка: отключённая кнопка держит
+                                        // ровно ту же высоту, что и настоящая строка.
+                                        None => {
+                                            let hint = if i == 0 {
+                                                "Спросите ИИ: напишите скрипт — он появится здесь."
+                                            } else {
+                                                ""
+                                            };
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Button::new(
+                                                    egui::RichText::new(hint).size(11.0),
+                                                )
+                                                .frame(false),
+                                            );
+                                        }
                                     }
                                 }
                             });
                         }
-                        ui.add_space(10.0);
-
-                        // ── Рекомендуется: свежие сгенерированные скрипты ──
-                        ui.label(egui::RichText::new("Рекомендуется").size(13.0).strong());
-                        ui.add_space(4.0);
-                        if host.recent_scripts.is_empty() {
-                            ui.label(egui::RichText::new("Пока пусто: попросите ИИ написать скрипт, и он появится здесь.")
-                                .size(11.0)
-                                .color(egui::Color32::from_rgb(150, 150, 155)));
-                        }
-                        for (id, name) in host.recent_scripts.iter().take(4) {
-                            // Плоская кнопка на всю ширину строки: клик по строке
-                            // запускает скрипт, как в «Рекомендуется» Windows 11.
-                            let label = format!("▸  {}", name);
-                            let btn = ui.add_sized(
-                                [ui.available_width(), 24.0],
-                                egui::Button::new(egui::RichText::new(label).size(12.0)).frame(false),
-                            );
-                            if btn.clicked() {
-                                intents.push(DesktopIntent::RunCommand(format!("/run {}", id)));
-                                close = true;
-                            }
-                        }
 
                         ui.add_space(12.0);
                         ui.separator();
-                        // ── Нижняя строка: пользователь слева, питание справа ──
+                        ui.add_space(8.0);
+
+                        // ── Нижняя строка: аватар с именем слева, питание справа ──
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("●  DamirSeversk").size(12.0));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("⏻  Выключение").clicked() {
-                                    intents.push(DesktopIntent::RunCommand("/exit".into()));
-                                    close = true;
-                                }
-                            });
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(26.0, 26.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().circle_filled(
+                                rect.center(),
+                                13.0,
+                                egui::Color32::from_rgb(64, 104, 176),
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "D",
+                                egui::FontId::proportional(13.0),
+                                egui::Color32::WHITE,
+                            );
+                            ui.label(egui::RichText::new("DamirSeversk").size(12.0));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("⏻  Выключение").clicked() {
+                                        intents
+                                            .push(DesktopIntent::RunCommand("/exit".into()));
+                                        close = true;
+                                    }
+                                },
+                            );
                         });
                     });
             });
@@ -617,6 +785,8 @@ impl Desktop {
         if close {
             self.start_open = false;
             self.start_query.clear();
+            // Вид «Все приложения» живёт ровно до закрытия меню.
+            self.start_all_apps = false;
         }
     }
 
@@ -803,30 +973,75 @@ impl Desktop {
     }
 }
 
-/// Плитка приложения в меню «Пуск»: глиф + имя, подсветка при наведении.
-/// Возвращает true по клику.
-fn start_tile(ui: &mut egui::Ui, glyph: &str, label: &str, id: egui::Id) -> bool {
-    // allocate_space возвращает (Id, Response) — прямоугольник берём у Response.
-    let rect = ui.allocate_space(egui::vec2(122.0, 70.0)).1;
+/// Плитка приложения в меню «Пуск»: иконка сверху, имя под ней и подсветка при
+/// наведении — так раскладаны плитки Windows 11. Возвращает true по клику.
+///
+/// Ширина приходит снаружи: сетка считает её от доступного места (4 колонки на
+/// 640 px), а не берёт из константы — иначе плитки не дотянули бы до края.
+fn start_tile(
+    ui: &mut egui::Ui,
+    glyph: &str,
+    label: &str,
+    id: egui::Id,
+    w: f32,
+    h: f32,
+) -> bool {
+    // allocate_space возвращает (Id, Rect) — прямоугольник берём у `.1`.
+    let rect = ui.allocate_space(egui::vec2(w, h)).1;
     let resp = ui.interact(rect, id, egui::Sense::click());
     if resp.hovered() {
         ui.painter().rect_filled(rect, 6.0, hover_bg());
     }
     ui.painter().text(
-        rect.center() - egui::vec2(0.0, 10.0),
+        rect.center() - egui::vec2(0.0, 9.0),
         egui::Align2::CENTER_CENTER,
         glyph,
-        egui::FontId::proportional(22.0),
+        egui::FontId::proportional(26.0),
         egui::Color32::WHITE,
     );
     ui.painter().text(
-        rect.center() + egui::vec2(0.0, 22.0),
+        rect.center() + egui::vec2(0.0, 21.0),
         egui::Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(11.0),
         egui::Color32::from_rgb(220, 220, 225),
     );
     resp.clicked()
+}
+
+/// Строка приложения в виде «Все приложения»: иконка и имя в одну линию,
+/// подсветка при наведении. Возвращает true по клику — намерение собирает
+/// вызывающий, потому что терминал открывается особым образом ([`open_intent`]).
+fn start_app_row(ui: &mut egui::Ui, wid: WindowId, h: f32) -> bool {
+    let (rect, resp) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 4.0, hover_bg());
+    }
+    ui.painter().text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        wid.glyph(),
+        egui::FontId::proportional(15.0),
+        egui::Color32::WHITE,
+    );
+    ui.painter().text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        wid.label(),
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(220, 220, 225),
+    );
+    resp.clicked()
+}
+
+/// Что делает клик по приложению в «Пуске»: терминал — сразу с фокусом в строке
+/// ввода (он для этого и существует), остальные окна — просто открываются.
+fn open_intent(wid: WindowId) -> DesktopIntent {
+    match wid {
+        WindowId::Terminal => DesktopIntent::FocusInput,
+        other => DesktopIntent::OpenWindow(other),
+    }
 }
 
 /// Иконки рабочего стола: все приложения (окна) плюс терминал с фокусом.
@@ -877,7 +1092,7 @@ fn default_icons() -> Vec<DesktopIcon> {
         DesktopIcon {
             glyph: WindowId::Explorer.glyph(),
             label: WindowId::Explorer.label(),
-            hint: "Файловый проводник с песочницей ядра",
+            hint: "Файловый проводник по всем дискам",
             action: IconAction::OpenWindow(WindowId::Explorer),
         },
         DesktopIcon {
