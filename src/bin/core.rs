@@ -47,24 +47,12 @@ fn main() {
     // Счётчик незавершённых фоновых задач — для /run и компиляции.
     let bg_tasks = Arc::new(AtomicUsize::new(0));
 
-    // Корень песочницы проводника. Резолвится один раз при старте — рабочая
-    // директория самого ядра (см. AGENTS: запускать из корня проекта, иначе
-    // оболочка и ядро увидят разные файлы). Именно против него проверяются
-    // все Fs*-пути, поэтому оболочка не может выйти за пределы проекта.
-    let sandbox_root: Arc<PathBuf> = Arc::new(
-        std::env::current_dir()
-            .ok()
-            .and_then(|p| std::fs::canonicalize(&p).ok())
-            .unwrap_or_else(|| PathBuf::from(".")),
-    );
-
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
                 let metrics = Arc::clone(&metrics);
                 let bg_tasks = Arc::clone(&bg_tasks);
-                let sandbox_root = Arc::clone(&sandbox_root);
-                thread::spawn(move || handle_client(stream, metrics, bg_tasks, sandbox_root));
+                thread::spawn(move || handle_client(stream, metrics, bg_tasks));
             }
             Err(e) => eprintln!("vanguard_core: сбой приёма соединения: {}", e),
         }
@@ -77,7 +65,6 @@ fn handle_client(
     stream: TcpStream,
     metrics: Arc<std::sync::Mutex<SystemMetrics>>,
     bg_tasks: Arc<AtomicUsize>,
-    root: Arc<PathBuf>,
 ) {
     let reader = BufReader::new(match stream.try_clone() {
         Ok(c) => c,
@@ -159,16 +146,16 @@ fn handle_client(
                 let out = vanguard_os_lib::core::shell::count_dialogue_lines();
                 send(&mut writer, &Response::ok(out.to_string()));
             }
-            // ── Проводник «Файлы»: всё через песочницу `root` ──
-            Request::FsList { path } => send(&mut writer, &fs_list(&root, &path)),
-            Request::FsRead { path } => send(&mut writer, &fs_read(&root, &path)),
+            // ── Проводник «Файлы»: пути абсолютные, песочницы больше нет ──
+            Request::FsList { path } => send(&mut writer, &fs_list(&path)),
+            Request::FsRead { path } => send(&mut writer, &fs_read(&path)),
             Request::FsWrite { path, content } => {
-                send(&mut writer, &fs_write(&root, &path, &content))
+                send(&mut writer, &fs_write(&path, &content))
             }
-            Request::FsCreate { path } => send(&mut writer, &fs_create(&root, &path)),
-            Request::FsMkdir { path } => send(&mut writer, &fs_mkdir(&root, &path)),
-            Request::FsRename { from, to } => send(&mut writer, &fs_rename(&root, &from, &to)),
-            Request::FsDelete { path } => send(&mut writer, &fs_delete(&root, &path)),
+            Request::FsCreate { path } => send(&mut writer, &fs_create(&path)),
+            Request::FsMkdir { path } => send(&mut writer, &fs_mkdir(&path)),
+            Request::FsRename { from, to } => send(&mut writer, &fs_rename(&from, &to)),
+            Request::FsDelete { path } => send(&mut writer, &fs_delete(&path)),
         }
     }
 
@@ -268,53 +255,49 @@ fn list_scripts() -> String {
 /// каждый кадр — лог в сотню мегабайтов положил бы рендер.
 const FS_VIEW_LIMIT: u64 = 1_048_576;
 
-/// Приводит относительный путь протокола к общему виду: слэши `/`, без
-/// ведущего и хвостового. Обе стороны хранят пути именно так, чтобы оболочке
-/// не приходилось знать о различиях Windows и остальных систем.
-fn fs_norm(rel: &str) -> String {
-    rel.replace('\\', "/").trim_matches('/').to_string()
-}
-
-/// Резолвит относительный путь песочницы в абсолютный и проверяет, что тот
-/// остался внутри корня.
+/// Резолвит абсолютный путь запроса в канонический.
 ///
-/// Проверка тройная, потому что ловушек здесь три:
-/// 1. компонент `..` (и `:` — префикс диска / альтернативный поток NTFS)
-///    отвергается **до** `canonicalize()`: иначе путь мог уйти наружу и
-///    вернуться обратно через junction, и проверка после была бы формальной;
-/// 2. `canonicalize()` работает только для существующих путей, а проводник
-///    создаёт новые — поэтому ищется ближайший существующий предок;
-/// 3. сравнение `starts_with(root)` идёт по компонентам, а не по тексту:
-///    `C:\vanguard_os_evil` не должен считаться наследником `C:\vanguard_os`.
-fn sandbox_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
-    let rel = fs_norm(rel);
-    if rel.is_empty() {
-        return Ok(root.to_path_buf());
+/// Песочницы больше нет: проводник видит все диски машины, как настоящий
+/// «Проводник Windows». Убрана она была не ради безопасности — папка проекта
+/// в качестве корня просто не показывала компьютер. Остались две проверки, и
+/// обе про корректность, а не про границы:
+/// 1. компонент `..` отвергается **до** `canonicalize()`: канонизация идёт от
+///    ближайшего существующего предка, и `..`, снятый по пути, остался бы в
+///    результате текстом — путь получился бы несуществующий;
+/// 2. путь обязан быть абсолютным. `C:файл` на Windows значит «относительно
+///    текущего каталога диска C», то есть ядро, запущенное из другой папки,
+///    ответило бы про другие файлы — та же ловушка CWD, что и у `/run`.
+///
+/// Несуществующий хвост — норма: и «новый файл», и `mkdir -p` с несколькими
+/// новыми уровнями. Канонизируется ближайший существующий предок, а снятые
+/// компоненты дописываются обратно; новая компонента ещё не может быть
+/// симлинком, поэтому доверять ей можно.
+fn resolve_path(input: &str) -> Result<PathBuf, String> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err("путь не задан".to_string());
     }
-    for part in rel.split('/') {
-        if part == ".." || part.contains(':') {
-            return Err("путь выходит за пределы песочницы".to_string());
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err("путь должен быть абсолютным (например C:\\Windows)".to_string());
+    }
+    for part in path.components() {
+        if matches!(part, std::path::Component::ParentDir) {
+            return Err("путь не может содержать «..»".to_string());
         }
     }
-    let joined = root.join(&rel);
 
-    // Несуществующий путь — норма: и «новый файл», и `mkdir -p` с несколькими
-    // новыми уровнями. Поднимаемся вверх до первого существующего каталога,
-    // канонизируем его (это и есть момент проверки границы) и дописываем
-    // снятые по пути компоненты обратно. Новая компонента не может быть
-    // симлинком — её ещё нет на диске, — так что доверять ей безопасно.
     let mut missing: Vec<std::ffi::OsString> = Vec::new();
-    let mut probe = joined;
+    let mut probe = path.to_path_buf();
     loop {
         match std::fs::canonicalize(&probe) {
-            Ok(p) if p.starts_with(root) => {
-                let mut resolved = p;
+            Ok(resolved) => {
+                let mut resolved = resolved;
                 for part in missing.iter().rev() {
                     resolved.push(part);
                 }
                 return Ok(resolved);
             }
-            Ok(_) => return Err("путь выходит за пределы песочницы".to_string()),
             Err(_) => {
                 let name = probe
                     .file_name()
@@ -331,11 +314,37 @@ fn sandbox_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
 }
 
 /// `canonicalize()` на Windows возвращает verbatim-путь `\\?\C:\...`. Для
-/// показа в строке пути проводника префикс срезаем. Сравнивать при этом надо
-/// по-прежнему каноническим путём — иначе `starts_with(root)` сломается.
+/// показа в строке пути и хлебных крошек проводника префикс срезаем — только
+/// для показа: сравнивать и удалять надо по каноническому пути.
 fn fs_pretty(path: &Path) -> String {
     let s = path.display().to_string();
     s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+}
+
+/// Дата изменения в секундах от Unix-эпохи; `0` — нет данных (или не смогли
+/// прочитать). Время на диске локальное, поэтому конвертация — в `Local`.
+fn fs_mtime(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Диски уровня «Этот компьютер»: `C:\`, `D:\` … `Z:\`, которые реально есть.
+///
+/// `A:` и `B:` пропускаются намеренно — на машине без дисковода обращение к
+/// ним отвечает медленно и без всякой пользы. `Path::exists()` здесь спрашивает
+/// `GetFileAttributes`, то есть это один системный вызов на букву.
+fn fs_drives() -> Vec<FsEntry> {
+    let mut out = Vec::new();
+    for letter in b'C'..=b'Z' {
+        let name = format!("{}:\\", letter as char);
+        if Path::new(&name).exists() {
+            out.push(FsEntry { name, is_dir: true, size: 0, mtime: 0 });
+        }
+    }
+    out
 }
 
 /// Складывает ответ проводника в IPC-формат: успех — JSON, ошибка — `Err`.
@@ -352,8 +361,14 @@ fn fs_reply<T: serde::Serialize>(result: Result<T, String>) -> Response {
 
 /// Список директории: сортировка «директории первыми, дальше по алфавиту» —
 /// ровно так, как в проводнике Windows.
-fn fs_list(root: &Path, rel: &str) -> Response {
-    let dir = match sandbox_path(root, rel) {
+///
+/// Пустой путь — виртуальный уровень «Этот компьютер»: там нет каталога,
+/// который можно прочитать, поэтому отдаются просто диски ([`fs_drives`]).
+fn fs_list(path: &str) -> Response {
+    if path.trim().trim_matches('\\').is_empty() {
+        return fs_reply(Ok(FsListing { path: String::new(), entries: fs_drives() }));
+    }
+    let dir = match resolve_path(path) {
         Ok(d) => d,
         Err(e) => return Response::err(e),
     };
@@ -367,10 +382,14 @@ fn fs_list(root: &Path, rel: &str) -> Response {
     let mut entries: Vec<FsEntry> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .flatten()
-            .map(|e| FsEntry {
-                name: e.file_name().to_string_lossy().into_owned(),
-                is_dir: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
-                size: e.metadata().map(|m| m.len()).unwrap_or(0),
+            .map(|e| {
+                let m = e.metadata().ok();
+                FsEntry {
+                    name: e.file_name().to_string_lossy().into_owned(),
+                    is_dir: e.file_type().map(|t| t.is_dir()).unwrap_or(false),
+                    size: m.as_ref().map(|m| m.len()).unwrap_or(0),
+                    mtime: m.as_ref().map(fs_mtime).unwrap_or(0),
+                }
             })
             .collect(),
         Err(e) => return Response::err(format!("не удалось прочитать каталог: {}", e)),
@@ -380,21 +399,17 @@ fn fs_list(root: &Path, rel: &str) -> Response {
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    fs_reply(Ok(FsListing {
-        path: fs_norm(rel),
-        root: fs_pretty(root),
-        entries,
-    }))
+    fs_reply(Ok(FsListing { path: fs_pretty(&dir), entries }))
 }
 
 /// Чтение файла. Бинарники отклоняются явно: `from_utf8` упал бы с ошибкой
 /// кодировки, а hex-дамп в редакторе — это шум, а не проводник.
-fn fs_read(root: &Path, rel: &str) -> Response {
-    let path = match sandbox_path(root, rel) {
+fn fs_read(path: &str) -> Response {
+    let abs = match resolve_path(path) {
         Ok(p) => p,
         Err(e) => return Response::err(e),
     };
-    let meta = match std::fs::metadata(&path) {
+    let meta = match std::fs::metadata(&abs) {
         Ok(m) => m,
         Err(e) => return Response::err(format!("не удалось открыть файл: {}", e)),
     };
@@ -407,26 +422,26 @@ fn fs_read(root: &Path, rel: &str) -> Response {
             meta.len() / 1024
         ));
     }
-    let bytes = match std::fs::read(&path) {
+    let bytes = match std::fs::read(&abs) {
         Ok(b) => b,
         Err(e) => return Response::err(format!("не удалось прочитать: {}", e)),
     };
     match String::from_utf8(bytes) {
-        Ok(content) => fs_reply(Ok(FsFile { path: fs_norm(rel), content })),
+        Ok(content) => fs_reply(Ok(FsFile { path: fs_pretty(&abs), content })),
         Err(_) => Response::err("файл не в UTF-8 — бинарник, показывать нечего".to_string()),
     }
 }
 
 /// Запись файла: создаёт или перезаписывает целиком. Перезапись здесь ожидаема —
 /// это путь SAVE; создание нового файла делает [`fs_create`].
-fn fs_write(root: &Path, rel: &str, content: &str) -> Response {
-    let path = match sandbox_path(root, rel) {
+fn fs_write(path: &str, content: &str) -> Response {
+    let abs = match resolve_path(path) {
         Ok(p) => p,
         Err(e) => return Response::err(e),
     };
-    match std::fs::write(&path, content) {
-        Ok(()) => fs_reply(Ok(fs_norm(rel))),
-        Err(e) => Response::err(format!("не удалось записать {}: {}", fs_norm(rel), e)),
+    match std::fs::write(&abs, content) {
+        Ok(()) => fs_reply(Ok(fs_pretty(&abs))),
+        Err(e) => Response::err(format!("не удалось записать {}: {}", fs_pretty(&abs), e)),
     }
 }
 
@@ -435,86 +450,90 @@ fn fs_write(root: &Path, rel: &str, content: &str) -> Response {
 /// кнопка «＋ Файл» молча обнуляла файл с занятым именем.
 /// `create_new(true)` падает с `AlreadyExists` атомарно, поэтому устаревший
 /// список каталога в оболочке не превращается в потерю данных.
-fn fs_create(root: &Path, rel: &str) -> Response {
-    let path = match sandbox_path(root, rel) {
+fn fs_create(path: &str) -> Response {
+    let abs = match resolve_path(path) {
         Ok(p) => p,
         Err(e) => return Response::err(e),
     };
     let opts = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path);
+        .open(&abs);
     match opts {
-        Ok(_) => fs_reply(Ok(fs_norm(rel))),
+        Ok(_) => fs_reply(Ok(fs_pretty(&abs))),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Response::err(format!("«{}» уже существует — имя занято.", fs_norm(rel)))
+            Response::err(format!("«{}» уже существует — имя занято.", fs_pretty(&abs)))
         }
-        Err(e) => Response::err(format!("не удалось создать {}: {}", fs_norm(rel), e)),
+        Err(e) => Response::err(format!("не удалось создать {}: {}", fs_pretty(&abs), e)),
     }
 }
 
 /// Создание каталога вместе со всеми родителями.
-fn fs_mkdir(root: &Path, rel: &str) -> Response {
-    let path = match sandbox_path(root, rel) {
+fn fs_mkdir(path: &str) -> Response {
+    let abs = match resolve_path(path) {
         Ok(p) => p,
         Err(e) => return Response::err(e),
     };
-    match std::fs::create_dir_all(&path) {
-        Ok(()) => fs_reply(Ok(fs_norm(rel))),
+    match std::fs::create_dir_all(&abs) {
+        Ok(()) => fs_reply(Ok(fs_pretty(&abs))),
         Err(e) => Response::err(format!("не удалось создать каталог: {}", e)),
     }
 }
 
-/// Переименование/перемещение. Корень песочницы защищён отдельно:
-/// `sandbox_path("")` легально возвращает его самого.
+/// Переименование/перемещение.
 ///
 /// На занятое имя не идёт: `std::fs::rename` заменяет цель молча («replacing
 /// the original file if `to` already exists», на Win10 1607+ как на Unix), а
 /// в проводнике это ошибка. `src == dst` — не «занято», а no-op.
-fn fs_rename(root: &Path, from: &str, to: &str) -> Response {
-    let src = match sandbox_path(root, from) {
+fn fs_rename(from: &str, to: &str) -> Response {
+    let src = match resolve_path(from) {
         Ok(p) => p,
         Err(e) => return Response::err(e),
     };
-    let dst = match sandbox_path(root, to) {
+    let dst = match resolve_path(to) {
         Ok(p) => p,
         Err(e) => return Response::err(e),
     };
-    if src == root {
-        return Response::err("корень песочницы переименовать нельзя".to_string());
+    // У корня диска `parent()` — None: переименовать `C:\` нельзя физически,
+    // но лучше сказать об этом словами, чем отдать сырой io::Error.
+    if src.parent().is_none() {
+        return Response::err("корень диска переименовать нельзя".to_string());
     }
     if src == dst {
         // То же имя — переименовывать нечего; без этого ранний выход ниже
         // сработал бы как «имя занято» на собственное имя файла.
-        return fs_reply(Ok(fs_norm(to)));
+        return fs_reply(Ok(fs_pretty(&dst)));
     }
     if dst.exists() {
-        return Response::err(format!("«{}» уже существует — имя занято.", fs_norm(to)));
+        return Response::err(format!("«{}» уже существует — имя занято.", fs_pretty(&dst)));
     }
     match std::fs::rename(&src, &dst) {
-        Ok(()) => fs_reply(Ok(fs_norm(to))),
+        Ok(()) => fs_reply(Ok(fs_pretty(&dst))),
         Err(e) => Response::err(format!("не удалось переименовать: {}", e)),
     }
 }
 
-/// Удаление: файл — как файл, директория — деревом целиком. `remove_dir_all`
-/// на корне уничтожил бы весь проект, поэтому он отдельно под запретом.
-fn fs_delete(root: &Path, rel: &str) -> Response {
-    let path = match sandbox_path(root, rel) {
+/// Удаление: файл — как файл, директория — деревом целиком.
+///
+/// Корень диска под запретом: `remove_dir_all("C:\\")` здесь — не гипотетический
+/// сценарий, а одна кнопка в списке, и остановился бы он только на паре
+/// защищённых системных файлов.
+fn fs_delete(path: &str) -> Response {
+    let abs = match resolve_path(path) {
         Ok(p) => p,
         Err(e) => return Response::err(e),
     };
-    if path == root {
-        return Response::err("корень песочницы удалить нельзя".to_string());
+    if abs.parent().is_none() {
+        return Response::err("корень диска удалить нельзя".to_string());
     }
-    let result = if path.is_dir() {
-        std::fs::remove_dir_all(&path)
+    let result = if abs.is_dir() {
+        std::fs::remove_dir_all(&abs)
     } else {
-        std::fs::remove_file(&path)
+        std::fs::remove_file(&abs)
     };
     match result {
-        Ok(()) => fs_reply(Ok(fs_norm(rel))),
-        Err(e) => Response::err(format!("не удалось удалить {}: {}", fs_norm(rel), e)),
+        Ok(()) => fs_reply(Ok(fs_pretty(&abs))),
+        Err(e) => Response::err(format!("не удалось удалить {}: {}", fs_pretty(&abs), e)),
     }
 }
 
