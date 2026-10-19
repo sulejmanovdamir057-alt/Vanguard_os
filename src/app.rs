@@ -167,7 +167,7 @@ pub struct VanguardOSApp {
     explorer_status: String,
     // 🗂 Проводник «Файлы»: настоящая файловая система через IPC-ядро.
     // Отдельно от explorer_* выше — те рисуют плоский список vanguard_gen_*.py,
-    // это — каталоги с песочницей и редактором.
+    // это — все диски машины с колонками и редактором.
     fs: FsExplorer,
     // 🧬 Самообучение (окно Neural Trainer): HF-модель для дообучения, счётчик
     // реплик в журнале диалогов, текстовый статус и флаг «тренировка идёт».
@@ -276,6 +276,11 @@ impl VanguardOSApp {
         // а чат читает их каждый кадр в check_ai_stream.
         let (ai_event_tx, ai_event_rx) = mpsc::channel::<AiEvent>();
 
+        // Шелл создаётся до сборки структуры: его счётчик bg_tasks нужен и
+        // проводнику «Файлы» — там свой Arc, но именно на этот же атом.
+        let shell = VanguardShell::new();
+        let fs_bg = Arc::clone(&shell.bg_tasks);
+
         let mut app = Self {
             win_w: BASE_W, win_h: BASE_H, cx: BASE_CX, cy: BASE_CY,
             boot_stage: BootStage::BarLoading, progress: 0.0, angle: 0.0,
@@ -290,11 +295,11 @@ impl VanguardOSApp {
             ],
             log_lines: Vec::new(), current_log_index: 0, user_input: String::new(),
             ai_text_area: String::from("VANGUARD CORE: Awaiting input command...\n"),
-            metrics_link: metrics, cpu_history: cpu_hist, shell: VanguardShell::new(),
+            metrics_link: metrics, cpu_history: cpu_hist, shell,
             windows: VanguardWindows::new(),
             explorer_sel: None,
             explorer_code: String::new(),
-            fs: FsExplorer::default(),
+            fs: FsExplorer::new(fs_bg),
             explorer_status: String::from("Выберите скрипт из списка слева."),
             // 🧬 Самообучение: модель по умолчанию — та же, что в Ollama, но в
             // формате HuggingFace; переопределяется env VANGUARD_TRAIN_HF_MODEL
@@ -1429,6 +1434,10 @@ impl eframe::App for VanguardOSApp {
         self.handle_boot_input(ctx);
         self.step_boot_logic();
         self.check_ai_stream();
+        // Ответы IPC проводника — тот же принцип, что у ИИ-стрима: дренируем
+        // каждый кадр без условий, иначе результат зависнет в канале до
+        // следующего открытия окна «Файлы», а bg_tasks не упадёт.
+        self.fs_drain();
 
         // egui уходит в сон, когда нет ввода (все request_repaint() живут в
         // окнах, закрытых по умолчанию). Пока ИИ стримится или крутится
@@ -1473,9 +1482,9 @@ impl eframe::App for VanguardOSApp {
             self.run_shell_command(&format!("/run {}", id));
         }
 
-        // 🗂 Окно «Файлы»: настоящий проводник по песочнице ядра. Список и
-        // редактор перечитываются по клику, а не каждый кадр — иначе на каждую
-        // рамку уходил бы IPC-вызов.
+        // 🗂 Окно «Файлы»: настоящий проводник по всем дискам. Список и
+        // редактор перечитываются по клику, а не каждый кадр; сами вызовы идут
+        // в фоне (см. app/fs_explorer.rs), здесь только рисование окна.
         self.draw_fs_window(ctx);
 
         // 🧬 Окно самообучения: журнал своих диалогов → QLoRA-дообучение модели.
