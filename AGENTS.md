@@ -136,7 +136,7 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
   (serde, `tag = "cmd"`/`"kind"`, `snake_case`) plus `CORE_PORT` (7331) and `core_addr()`.
   Single source of truth for the wire format. Add a request here first, then a handler in
   `bin/core.rs`, then a caller. The `Fs*` requests (file explorer) also carry their payload
-  types here (`FsEntry`/`FsListing`/`FsFile`) — see the sandbox section below.
+  types here (`FsEntry`/`FsListing`/`FsFile`) — see the file-explorer section below.
 - `src/ai_core.rs` — the AI request, split into three: `build_request` (env config, message
   assembly, body — **pure, no I/O**, returns `Err(String)` instead of sending events),
   `spawn_ai_request` (thread, agent, POST, non-2xx check) and `stream_sse` (the SSE reader),
@@ -160,7 +160,7 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
   each with its own `VanguardShell` (independent dialogue history). Maps `Request` → work:
   `Shell` → `dispatch_shell`, `RunScript`/`CompileRust` → background thread streaming
   `Event::TaskLog` back over the same socket, the rest synchronously — including all seven `Fs*`
-  handlers, which run inside `sandbox_path()` (see the sandbox section). `send()` swallows write
+  handlers, which run inside `resolve_path()` (see the file-explorer section). `send()` swallows write
   errors on purpose — a client that disconnected mid-stream must not panic the core.
 - `src/main.rs` — `vanguard_os` main: spawns the shell's telemetry daemon, then
   `eframe::run_native`. `#![windows_subsystem = "windows"]`, prints nothing to stdout.
@@ -170,12 +170,12 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
   builds a `DesktopHost` each frame and executes the returned `DesktopIntent`s via
   `apply_desktop_intent`. It still owns the `fs: FsExplorer` field; every line behind that
   field lives in the child module right below.
-- `src/app/fs_explorer.rs` — the "Файлы" window: `FsExplorer`, the `fs_*` IPC helpers and
-  `draw_fs_window`, itself split into five free functions (`fs_row_path`, `fs_row_actions`,
-  `fs_panes`, `fs_row_status`; the two panes live inside `fs_panes`) over three shared ones:
-  `fs_apply`, `fs_named_input`, `fs_btn_create`. They exist because the same
-  `match fs_call { Ok => reload, Err => status }` appeared **four** times, the empty-name check
-  **three** times and a near-identical create button **twice** — behaviour now changes once.
+- `src/app/fs_explorer.rs` — the "Файлы" window: `FsExplorer`, the `FsKind`/`FsReply` pair that
+  tells the background thread what to parse, the `fs_*` IPC helpers and `draw_fs_window`, itself
+  split into five free functions (`fs_row_path`, `fs_row_actions`, `fs_panes`, `fs_row_status`;
+  the two panes live inside `fs_panes`) over two shared ones (`fs_named_input`, `fs_btn_create`).
+  There is no `fs_apply` any more: **no `Fs*` call runs on the UI thread**, so the old
+  `match fs_call { Ok => reload, Err => status }` became `fs_spawn` + `fs_drain`.
   - **It is a child module of `app`, not a sibling:** `mod fs_explorer;` is declared *inside*
     `app.rs`, which resolves to `src/app/fs_explorer.rs`. Private fields of `VanguardOSApp` are
     visible only in the declaring module **and its descendants**, so a sibling registered in
@@ -212,6 +212,14 @@ then `Ok("<< TASK DONE >>")`. `saw_final` + `break` in the match arms is what ma
 do not "clean it up" into a plain `for` loop.
 
 Two more invariants:
+
+- **The file explorer's IPC is background too — and drained unconditionally.** `fs_spawn`
+  (`app/fs_explorer.rs`) `fetch_add`s on the same `bg_tasks`, hands the reply to a channel, and
+  `VanguardOSApp::fs_drain` reads it back `fetch_sub`ing afterwards. `update()` calls `fs_drain()`
+  right after `check_ai_stream()` with no gate: `busy`/`pending` do the gating, not the frame.
+  Moving the drain into `draw_fs_window` would strand a reply if the window closed mid-flight;
+  decrementing before the read would let egui sleep on an unread result. It also means opening
+  «Файлы» no longer freezes the window for the ~3 s an uncached `C:\` listing used to cost.
 
 - **Heavy work is async and holds `bg_tasks`.** `app.rs::try_core_run` and the AI's Rust-compile
   path both `fetch_add` on `shell.bg_tasks` before spawning the IPC thread and `fetch_sub`
@@ -320,8 +328,8 @@ the split there are **two processes with two CWDs**:
   (`cargo run --bin vanguard_core` from `src/`, say), its CWD differs and `/run` will report
   "file not found" for scripts the shell can clearly see. **Start the core from the repo root**
   (or let the shell spawn it) — that is the whole reason `cargo run` alone is enough.
-  The same CWD is the **sandbox root** of the file explorer (see the sandbox section): a core
-  started from `src/` would show `src/`'s children as the whole "computer".
+  The file explorer no longer depends on the CWD at all (it now spans every drive), so a core
+  started from `src/` lists the same disks as one started from the repo root.
 
 Generated artifacts, all relative to the *core's* CWD: `vanguard_gen_<id>.py`,
 `vanguard_tmp_<id>.rs`, `vanguard_app_<id>.exe`, `vanguard_script_<id>.bat|.sh`.
@@ -352,22 +360,33 @@ down, and both must stay in sync if you change compile flags).
 Slash-commands: `/help /apps /run <id> /hardware /wipe /reset /exit`. Anything else that does not
 start with `/` is sent to the LLM.
 
-## File explorer «Файлы» — the core sandbox (added 2026-10-14)
+## File explorer «Файлы» — all drives, sandbox removed (added 2026-10-14, jail cut 2026-10-18)
 
 Seven requests in `src/ipc.rs` (`FsList`/`FsRead`/`FsWrite`/`FsCreate`/`FsMkdir`/`FsRename`/`FsDelete`)
-and their handlers in `src/bin/core.rs`. Every path a client sends is **relative to the sandbox
-root** — the empty string means the root itself — and every one of them goes through
-`core.rs::sandbox_path(root, rel)` before it may touch disk.
+and their handlers in `src/bin/core.rs`. Every path a client sends is now **absolute**
+(`C:\Users\...`), and an empty `FsList.path` means the virtual level «Этот компьютер», where the
+core answers with the drive letters it finds (`C:\`, `D:\` …). Every path still goes through
+`core.rs::resolve_path()` before it may touch disk.
+
+The old jail (`sandbox_path(root, rel)` against `canonicalize(current_dir())`) was removed on
+purpose: with the project directory as the root, «Файлы» showed a folder instead of a computer.
+What is left below is not a boundary any more — it is correctness, plus two guards against the
+worst one-click accidents.
+
+The shell side of the feature is background now: `fs_spawn` puts every `Fs*` call on its own
+thread and `VanguardOSApp::fs_drain` reads the reply back — see the `bg_tasks` invariant in the
+IPC section above.
 
 | rule | why it exists |
 |---|---|
-| the root is `canonicalize(env::current_dir())` once at core startup | it is the core's CWD, so it agrees with `/run`'s relative paths; canonicalizing once means `starts_with` compares against a real path |
-| `..` and `:` are rejected **as text, before** `canonicalize()` | otherwise a path could leave and come back through a junction, and a check after the fact would be formal |
+| `..` is rejected **as text, before** `canonicalize()` | canonicalization walks up from the nearest existing prefix, so a `..` peeled off along the way would survive into the result as plain text and the resulting path would not exist |
+| the path must be absolute | `C:file` on Windows means "relative to the current directory of drive C", so two cores started from different CWDs would answer about different files — the same trap `/run` already documents |
 | the longest existing prefix is canonicalized, missing components re-appended | `canonicalize()` needs an existing path; `mkdir -p` and "new file" create two new levels at once. A not-yet-existing component cannot be a symlink, so trusting it is safe |
-| comparison is `starts_with(root)`, component-wise | `C:\vanguard_os_evil` must not count as a child of `C:\vanguard_os` |
-| the root itself may be listed and read but **not** deleted or renamed | `sandbox_path("")` legally returns the root; `remove_dir_all` there would take the whole project |
+| the **drive root** may be listed but not deleted or renamed | `Path::parent()` is `None` there; `remove_dir_all("C:\")` is one click away in the list and would stop only on a couple of protected system files |
+| `A:` and `B:` are skipped when enumerating drives | on a machine without a floppy `GetFileAttributes` on those letters answers slowly and for nothing |
 | files over 1 MiB and non-UTF-8 files are refused by `FsRead` | the shell keeps the text in memory and repaints it every frame |
 | create and rename **refuse an occupied name** instead of replacing it | `fs::write` truncates an existing file and `fs::rename` replaces the target silently (std docs: "replacing the original file if `to` already exists"; on Win10 1607+ it matches Unix), so «＋ Файл» used to zero a file whose name was taken and rename used to destroy the victim. `FsCreate` uses `create_new(true)` — an atomic `AlreadyExists` — and `fs_rename` checks `dst.exists()`; `src == dst` is a deliberate no-op, not "occupied". `FsWrite` itself **still overwrites**: it is the SAVE path for the file already open in the editor |
+| the GUI's `✕ Удалить` is **two clicks** | the jail is gone, so a single stray click on a selected row could remove a whole tree. The first click only arms `FsExplorer::confirm` and relabels the button; changing the selection disarms it. This is the GUI's rule, not the core's — `FsDelete` itself will happily delete any non-root path |
 
 `fs_pretty()` strips Windows' `\\?\` verbatim prefix for **display only** (the path bar would
 otherwise read `\\?\C:\Users\...`); never compare against the pretty string.
@@ -377,15 +396,28 @@ shell deserializes them in `app.rs` — putting them anywhere else would break t
 truth" rule the same file already states for the wire format. Note `FsListing.entries` arrives
 **pre-sorted** (directories first, then case-insensitive name); the GUI must not re-sort.
 
+Two wire-level details worth not "cleaning up":
+
+- `FsEntry.mtime` is `#[serde(default)]`. It was added after the other fields, and
+  `vanguard_core.exe` **outlives** the shell — a not-yet-restarted old core simply omits it, and
+  a hard requirement would break parsing of the whole listing instead of just one column.
+- `FsListing.path` is the core's **canonical** answer and `fs_apply_reply` overwrites the GUI's
+  own `fs.path` with it. That is why the breadcrumb bar always names what was really listed
+  (register, junctions and doubled slashes get normalised there), and why a failed navigation
+  leaves the previous path in place rather than a path nobody reached. The GUI never sets
+  `fs.path` at click time for the same reason.
+
 Smoke test: `%TEMP%\opencode\fs_smoke.ps1` (ASCII-only — PS 5.1 chokes on Cyrillic in a `.ps1`
 here) starts a fresh `vanguard_core.exe` over 8.3 short paths, drives the six original requests
 over raw TCP and parses both JSON levels of `Response::Ok`. It asserts behaviour, not message
-text — the error strings are Russian, so substring matching on them is unreliable. 32 checks, last
-run 2026-10-14, all passing. It predates `FsCreate` and the occupied-name row above: those were
-checked by hand over raw TCP on 2026-10-19 (13 checks — create and rename refusing a taken name,
-the victim's content intact afterwards, `FsWrite` still overwriting on the SAVE path, `..` still
-rejected by the new request too, and no scratch files left in the repo). Fold that coverage into
-the script next time it is touched.
+text — the error strings are Russian, so substring matching on them is unreliable. **46 checks,
+last run 2026-10-19, all passing** — virtual root listing drives, `mtime` carried, `..`/relative/
+blank rejected, drive-root delete and rename refused, `create_new` occupied-name guard, rename
+refusing an occupied target with the victim intact, `FsWrite` still overwriting on the SAVE path,
+and no scratch files left behind. Two PS 5.1 traps it encodes: every `.Count` goes through `@()`
+(a *single* object reports `$null`, not `1`), and the path used for assertions is taken from the
+core's own reply, because `$env:TEMP` is an **8.3 short name** in this environment
+(`C:\Users\73B5~1\...`) while the core echoes the canonical long one.
 
 ## Self-finetune loop — Neural Trainer window (added 2026-10-12)
 
