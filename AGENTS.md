@@ -155,7 +155,7 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
 - `src/bin/core.rs` — `vanguard_core` main: binds `127.0.0.1:7331`, one thread per connection,
   each with its own `VanguardShell` (independent dialogue history). Maps `Request` → work:
   `Shell` → `dispatch_shell`, `RunScript`/`CompileRust` → background thread streaming
-  `Event::TaskLog` back over the same socket, the rest synchronously — including all six `Fs*`
+  `Event::TaskLog` back over the same socket, the rest synchronously — including all seven `Fs*`
   handlers, which run inside `sandbox_path()` (see the sandbox section). `send()` swallows write
   errors on purpose — a client that disconnected mid-stream must not panic the core.
 - `src/main.rs` — `vanguard_os` main: spawns the shell's telemetry daemon, then
@@ -338,9 +338,9 @@ start with `/` is sent to the LLM.
 
 ## File explorer «Файлы» — the core sandbox (added 2026-10-14)
 
-Six requests in `src/ipc.rs` (`FsList`/`FsRead`/`FsWrite`/`FsMkdir`/`FsRename`/`FsDelete`) and their
-handlers in `src/bin/core.rs`. Every path a client sends is **relative to the sandbox root** — the
-empty string means the root itself — and every one of them goes through
+Seven requests in `src/ipc.rs` (`FsList`/`FsRead`/`FsWrite`/`FsCreate`/`FsMkdir`/`FsRename`/`FsDelete`)
+and their handlers in `src/bin/core.rs`. Every path a client sends is **relative to the sandbox
+root** — the empty string means the root itself — and every one of them goes through
 `core.rs::sandbox_path(root, rel)` before it may touch disk.
 
 | rule | why it exists |
@@ -351,6 +351,7 @@ empty string means the root itself — and every one of them goes through
 | comparison is `starts_with(root)`, component-wise | `C:\vanguard_os_evil` must not count as a child of `C:\vanguard_os` |
 | the root itself may be listed and read but **not** deleted or renamed | `sandbox_path("")` legally returns the root; `remove_dir_all` there would take the whole project |
 | files over 1 MiB and non-UTF-8 files are refused by `FsRead` | the shell keeps the text in memory and repaints it every frame |
+| create and rename **refuse an occupied name** instead of replacing it | `fs::write` truncates an existing file and `fs::rename` replaces the target silently (std docs: "replacing the original file if `to` already exists"; on Win10 1607+ it matches Unix), so «＋ Файл» used to zero a file whose name was taken and rename used to destroy the victim. `FsCreate` uses `create_new(true)` — an atomic `AlreadyExists` — and `fs_rename` checks `dst.exists()`; `src == dst` is a deliberate no-op, not "occupied". `FsWrite` itself **still overwrites**: it is the SAVE path for the file already open in the editor |
 
 `fs_pretty()` strips Windows' `\\?\` verbatim prefix for **display only** (the path bar would
 otherwise read `\\?\C:\Users\...`); never compare against the pretty string.
@@ -361,10 +362,14 @@ truth" rule the same file already states for the wire format. Note `FsListing.en
 **pre-sorted** (directories first, then case-insensitive name); the GUI must not re-sort.
 
 Smoke test: `%TEMP%\opencode\fs_smoke.ps1` (ASCII-only — PS 5.1 chokes on Cyrillic in a `.ps1`
-here) starts a fresh `vanguard_core.exe` over 8.3 short paths, drives all six requests over raw
-TCP and parses both JSON levels of `Response::Ok`. It asserts behaviour, not message text — the
-error strings are Russian, so substring matching on them is unreliable. 32 checks, last run
-2026-10-14, all passing.
+here) starts a fresh `vanguard_core.exe` over 8.3 short paths, drives the six original requests
+over raw TCP and parses both JSON levels of `Response::Ok`. It asserts behaviour, not message
+text — the error strings are Russian, so substring matching on them is unreliable. 32 checks, last
+run 2026-10-14, all passing. It predates `FsCreate` and the occupied-name row above: those were
+checked by hand over raw TCP on 2026-10-19 (13 checks — create and rename refusing a taken name,
+the victim's content intact afterwards, `FsWrite` still overwriting on the SAVE path, `..` still
+rejected by the new request too, and no scratch files left in the repo). Fold that coverage into
+the script next time it is touched.
 
 ## Self-finetune loop — Neural Trainer window (added 2026-10-12)
 

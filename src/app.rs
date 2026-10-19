@@ -1456,10 +1456,13 @@ impl VanguardOSApp {
                         self.fs.failed = true;
                     } else {
                         let path = fs_join(&self.fs.path, self.fs.input.trim());
-                        match fs_call::<String>(Request::FsWrite {
-                            path,
-                            content: String::new(),
-                        }) {
+                        // FsCreate, а не FsWrite с пустым содержимым: тот
+                        // перезаписывает существующий файл целиком, и кнопка
+                        // молча обнуляла файл с уже занятым именем. Ядро
+                        // дополнительно отклоняет занятое имя (`create_new`),
+                        // поэтому устаревший список каталога не превратится
+                        // в потерю данных.
+                        match fs_call::<String>(Request::FsCreate { path }) {
                             Ok(_) => fs_reload(&mut self.fs),
                             Err(e) => {
                                 self.fs.status = e;

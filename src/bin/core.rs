@@ -165,6 +165,7 @@ fn handle_client(
             Request::FsWrite { path, content } => {
                 send(&mut writer, &fs_write(&root, &path, &content))
             }
+            Request::FsCreate { path } => send(&mut writer, &fs_create(&root, &path)),
             Request::FsMkdir { path } => send(&mut writer, &fs_mkdir(&root, &path)),
             Request::FsRename { from, to } => send(&mut writer, &fs_rename(&root, &from, &to)),
             Request::FsDelete { path } => send(&mut writer, &fs_delete(&root, &path)),
@@ -416,7 +417,9 @@ fn fs_read(root: &Path, rel: &str) -> Response {
     }
 }
 
-/// Запись файла: создаёт или перезаписывает целиком.
+/// Запись файла: создаёт или перезаписывает целиком. Назначен на сохранение
+/// открытого в редакторе файла, поэтому перезапись здесь ожидаема. Для создания
+/// нового файла есть [`fs_create`] — он один не даёт занялому имени исчезнуть.
 fn fs_write(root: &Path, rel: &str, content: &str) -> Response {
     let path = match sandbox_path(root, rel) {
         Ok(p) => p,
@@ -425,6 +428,32 @@ fn fs_write(root: &Path, rel: &str, content: &str) -> Response {
     match std::fs::write(&path, content) {
         Ok(()) => fs_reply(Ok(fs_norm(rel))),
         Err(e) => Response::err(format!("не удалось записать {}: {}", fs_norm(rel), e)),
+    }
+}
+
+/// Создание нового пустого файла.
+///
+/// Отдельный запрос, а не `fs_write` с пустым содержимым: `fs::write` создаёт
+/// файл **или урезает существующий до нуля**, так что кнопка «＋ Файл» молча
+/// обнуляла файл с уже занятым именем — потеря данных без единого намёка.
+/// `create_new(true)` запрашивает создание атомарно и падает с `AlreadyExists`,
+/// если файл появился между проверкой и созданием — устаревший список каталога
+/// в оболочке поэтому ничего не ломает.
+fn fs_create(root: &Path, rel: &str) -> Response {
+    let path = match sandbox_path(root, rel) {
+        Ok(p) => p,
+        Err(e) => return Response::err(e),
+    };
+    let opts = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path);
+    match opts {
+        Ok(_) => fs_reply(Ok(fs_norm(rel))),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Response::err(format!("«{}» уже существует — имя занято.", fs_norm(rel)))
+        }
+        Err(e) => Response::err(format!("не удалось создать {}: {}", fs_norm(rel), e)),
     }
 }
 
@@ -442,6 +471,12 @@ fn fs_mkdir(root: &Path, rel: &str) -> Response {
 
 /// Переименование/перемещение. Корень песочницы защищён отдельно:
 /// `sandbox_path("")` легально возвращает его самого.
+///
+/// На занятое имя переименование **не** идёт: `std::fs::rename` заменяет
+/// существующий файл молча (документация std: «replacing the original file if
+/// `to` already exists», и на Windows 10 1607+ поведение совпадает с Unix),
+/// а в проводнике переименование на занятое имя — это ошибка, как в
+/// Windows-Обозревателе, а не тихая потеря содержимого цели.
 fn fs_rename(root: &Path, from: &str, to: &str) -> Response {
     let src = match sandbox_path(root, from) {
         Ok(p) => p,
@@ -453,6 +488,14 @@ fn fs_rename(root: &Path, from: &str, to: &str) -> Response {
     };
     if src == root {
         return Response::err("корень песочницы переименовать нельзя".to_string());
+    }
+    if src == dst {
+        // То же имя — переименовывать нечего; без этого ранний выход ниже
+        // сработал бы как «имя занято» на собственное имя файла.
+        return fs_reply(Ok(fs_norm(to)));
+    }
+    if dst.exists() {
+        return Response::err(format!("«{}» уже существует — имя занято.", fs_norm(to)));
     }
     match std::fs::rename(&src, &dst) {
         Ok(()) => fs_reply(Ok(fs_norm(to))),
