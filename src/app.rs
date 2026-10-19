@@ -18,6 +18,12 @@ use crate::desktop::{Desktop, DesktopHost, DesktopIntent, INPUT_FIELD_ID};
 use crate::settings::{self, AppSettings};
 use crate::ui_window::{VanguardWindows, WindowId};
 
+/// Проводник «Файлы»: состояние окна, IPC-хелперы `fs_*` и само окно. Дочерний
+/// модуль, а не братский — ему нужны приватные поля `VanguardOSApp` (см. шапку
+/// модуля): private-видимость распространяется на предка и его потомков.
+mod fs_explorer;
+use fs_explorer::FsExplorer;
+
 
 /// Файл заметков блокнота. Пишется относительно CWD — как и все артефакты проекта.
 const NOTES_FILE: &str = "vanguard_notes.txt";
@@ -105,170 +111,6 @@ pub const BASE_W: f32 = 1024.0;
 pub const BASE_H: f32 = 768.0;
 const BASE_CX: f32 = 512.0;
 const BASE_CY: f32 = 284.0;
-
-// ─── Проводник «Файлы» ──────────────────────────────────────────────────────
-
-/// Состояние окна «Файлы».
-///
-/// Оболочка сама к диску не тянется: всё делает ядро внутри своей песочницы
-/// (корень = рабочий каталог ядра, проверка пути — `sandbox_path` в
-/// `bin/core.rs`). Здесь лежит только последний ответ `FsList` и открытый в
-/// редакторе файл — поэтому `draw_fs_window` не делает ни одного `std::fs`.
-#[derive(Default)]
-struct FsExplorer {
-    /// Текущий каталог относительно корня песочницы, слэши `/` ("" = корень).
-    path: String,
-    /// Абсолютный корень песочницы — из первого ответа, для строки пути.
-    root: String,
-    /// Последний список от ядра: порядок уже приведён к «каталоги первыми».
-    entries: Vec<FsEntry>,
-    /// Выбранная запись — имя внутри текущего каталога.
-    sel: Option<String>,
-    /// Открытый файл: его относительный путь и содержимое в редакторе.
-    file: String,
-    code: String,
-    /// В редакторе есть правки, которых ещё нет на диске.
-    dirty: bool,
-    /// Строка ввода для «создать» / «переименовать» и статусная строка.
-    input: String,
-    status: String,
-    /// Последняя операция закончилась ошибкой — статус красим в красный.
-    failed: bool,
-    /// Список уже запрашивался хотя бы раз: иначе при мёртвом ядре окно
-    /// стучалось бы заново на каждой рамке и клало рендер на 3 с ожидания.
-    loaded: bool,
-}
-
-/// Склеивает каталог и имя элемента в путь протокола: слэши `/`, без ведущего.
-/// Ядро приведёт его к абсолютному и проверит, что тот внутри песочницы.
-fn fs_join(dir: &str, name: &str) -> String {
-    let dir = dir.trim_matches('/');
-    let name = name.trim_matches('/');
-    if dir.is_empty() {
-        name.to_string()
-    } else {
-        format!("{}/{}", dir, name)
-    }
-}
-
-/// Родительский каталог: `"src/core"` → `"src"`, `"src"` → `""`.
-fn fs_parent(dir: &str) -> String {
-    let dir = dir.trim_matches('/');
-    match dir.rfind('/') {
-        Some(i) => dir[..i].to_string(),
-        None => String::new(),
-    }
-}
-
-/// Один IPC-вызов к ядру и разбор JSON-ответа. Полезная нагрузка едет в тексте
-/// `Ok` — так устроен весь протокол, — поэтому и ошибка, и битый ответ
-/// сводятся к одной строке, которую показывает статусная строка окна.
-fn fs_call<T: serde::de::DeserializeOwned>(req: Request) -> Result<T, String> {
-    let json = serde_json::to_string(&req)
-        .map_err(|e| format!("не удалось сериализовать запрос: {}", e))?;
-    let reply = crate::ipc_client::call(&json);
-    if !reply.ok {
-        return Err(reply.text.trim().to_string());
-    }
-    serde_json::from_str::<T>(&reply.text).map_err(|e| format!("ядро ответило не тем: {}", e))
-}
-
-/// Перечитывает текущий каталог у ядра.
-///
-/// Отдельная функция, а не метод `VanguardOSApp` — тот же приём, что у
-/// `walk_history`: окно вызывает её внутри `show()`, где `&mut self` целиком
-/// уже занят отрисовкой самого окна, а заимствуется тут только `FsExplorer`.
-fn fs_reload(fs: &mut FsExplorer) {
-    match fs_call::<FsListing>(Request::FsList { path: fs.path.clone() }) {
-        Ok(list) => {
-            fs.root = list.root;
-            fs.entries = list.entries;
-            fs.status = format!("{} объектов", fs.entries.len());
-            fs.failed = false;
-        }
-        Err(e) => {
-            fs.entries.clear();
-            fs.status = e;
-            fs.failed = true;
-        }
-    }
-}
-
-/// Уход из каталога или на другой файл. Если в редакторе несохранённые правки,
-/// переход отклоняется — иначе текст потерялся бы молча.
-fn fs_leave(fs: &mut FsExplorer) -> bool {
-    if fs.dirty {
-        fs.status = String::from("Сначала SAVE — иначе правки в редакторе потеряются.");
-        fs.failed = true;
-        return false;
-    }
-    fs.file.clear();
-    fs.code.clear();
-    true
-}
-
-/// Вверх на каталог.
-fn fs_up(fs: &mut FsExplorer) {
-    if !fs_leave(fs) {
-        return;
-    }
-    fs.path = fs_parent(&fs.path);
-    fs.sel = None;
-    fs_reload(fs);
-}
-
-/// Войти в подкаталог.
-fn fs_enter(fs: &mut FsExplorer, dir: &str) {
-    if !fs_leave(fs) {
-        return;
-    }
-    fs.path = fs_join(&fs.path, dir);
-    fs.sel = None;
-    fs_reload(fs);
-}
-
-/// Открыть файл в редакторе.
-fn fs_open_file(fs: &mut FsExplorer, name: &str) {
-    if !fs_leave(fs) {
-        return;
-    }
-    let path = fs_join(&fs.path, name);
-    match fs_call::<FsFile>(Request::FsRead { path }) {
-        Ok(f) => {
-            fs.file = f.path;
-            fs.code = f.content;
-            fs.dirty = false;
-            fs.status = format!("Открыт: {}", fs.file);
-            fs.failed = false;
-        }
-        Err(e) => {
-            fs.status = e;
-            fs.failed = true;
-        }
-    }
-}
-
-/// Записать открытый файл обратно в песочницу.
-fn fs_save(fs: &mut FsExplorer) {
-    if fs.file.is_empty() {
-        fs.status = String::from("Файл не открыт.");
-        fs.failed = true;
-        return;
-    }
-    let path = fs.file.clone();
-    let content = fs.code.clone();
-    match fs_call::<String>(Request::FsWrite { path: path.clone(), content }) {
-        Ok(_) => {
-            fs.dirty = false;
-            fs.status = format!("Сохранено: {}", path);
-            fs.failed = false;
-        }
-        Err(e) => {
-            fs.status = e;
-            fs.failed = true;
-        }
-    }
-}
 
 pub struct VanguardOSApp {
     /// Размер реального вьюпорта (обновляется каждый кадр в `update`) и центр,
@@ -1373,251 +1215,6 @@ impl VanguardOSApp {
         explorer_run
     }
 
-    /// Окно «Файлы»: проводник по песочнице ядра. Слева список текущего
-    /// каталога, справа редактор открытого файла. Ни одного обращения к диску
-    /// здесь нет — только IPC, где пути считает и проверяет ядро.
-    ///
-    /// Запросы уходят прямо из замыкания, а не после `show()`: заимствуются
-    /// `self.windows.explorer` и `self.fs` — непересекающиеся поля, поэтому
-    /// borrow-checker это пропускает (то же работает и в `draw_scripts_window`).
-    fn draw_fs_window(&mut self, ctx: &egui::Context) {
-        // Высоты рядов задаются явно — см. развёрнутый комментарий у строки пути.
-        const ROW_H: f32 = 30.0;
-        const PANE_H: f32 = 300.0;
-        if !self.windows.explorer.is_open {
-            // Окно закрыто — сбрасываем флаг: при следующем открытии список
-            // должен перечитаться у ядра, файлы могли измениться извне.
-            self.fs.loaded = false;
-            return;
-        }
-        if !self.fs.loaded {
-            // Первое открытие: список ещё пуст — просим ядро.
-            self.fs.loaded = true;
-            fs_reload(&mut self.fs);
-        }
-
-        self.windows.explorer.show(ctx, |ui| {
-            // ── Строка пути: корень песочницы + текущий относительный путь ──
-            //
-            // Явная высота вместо ui.horizontal(): тот — left_to_right(Align::Center)
-            // и растягивает рамку ряда на всё окно (layout.rs:611-615), так что два
-            // служебных ряда сверху съедали высоту и поле кода обрезалось до 46 px
-            // (замер: row size=740x18, ScrollArea раздувался до 64 min_scrolled_size).
-            // Align::Min с фиксированной высотой такого не делает.
-            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), ROW_H), egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                if ui.button("↑").on_hover_text("Вверх").clicked() {
-                    fs_up(&mut self.fs);
-                }
-                let shown = if self.fs.path.is_empty() {
-                    self.fs.root.clone()
-                } else {
-                    format!("{}\\{}", self.fs.root, self.fs.path.replace('/', "\\"))
-                };
-                ui.monospace(shown);
-                if ui.button("⟳").on_hover_text("Обновить список").clicked() {
-                    fs_reload(&mut self.fs);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.colored_label(egui::Color32::from_rgb(130, 130, 135), "двойной клик — открыть");
-                });
-            },
-            );
-
-            // ── Действия: имя берётся из строки ввода, «кто» — из выделения ──
-            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), ROW_H), egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.fs.input)
-                        .hint_text("имя файла или папки")
-                        .desired_width(190.0),
-                );
-                if ui.button("＋ Папка").clicked() {
-                    if self.fs.input.trim().is_empty() {
-                        self.fs.status = String::from("Введите имя папки.");
-                        self.fs.failed = true;
-                    } else {
-                        let path = fs_join(&self.fs.path, self.fs.input.trim());
-                        match fs_call::<String>(Request::FsMkdir { path }) {
-                            Ok(_) => fs_reload(&mut self.fs),
-                            Err(e) => {
-                                self.fs.status = e;
-                                self.fs.failed = true;
-                            }
-                        }
-                    }
-                }
-                if ui.button("＋ Файл").clicked() {
-                    if self.fs.input.trim().is_empty() {
-                        self.fs.status = String::from("Введите имя файла.");
-                        self.fs.failed = true;
-                    } else {
-                        let path = fs_join(&self.fs.path, self.fs.input.trim());
-                        // FsCreate, а не FsWrite с пустым содержимым: тот обнулял
-                        // бы файл с уже занятым именем. Проверка занятости — на
-                        // стороне ядра (`create_new`), а не по нашему списку:
-                        // тот может отставать от диска.
-                        match fs_call::<String>(Request::FsCreate { path }) {
-                            Ok(_) => fs_reload(&mut self.fs),
-                            Err(e) => {
-                                self.fs.status = e;
-                                self.fs.failed = true;
-                            }
-                        }
-                    }
-                }
-                ui.separator();
-                // Клонируем имя сразу: ниже идёт `&mut self.fs`, а цикл по
-                // entries держал бы на него заимствование.
-                let sel_name = self.fs.sel.clone();
-                let has_sel = sel_name.is_some();
-                if ui.add_enabled(has_sel, egui::Button::new("→ Переименовать")).clicked() {
-                    // По ссылке: имя нужно ещё ниже, в ветке «Удалить».
-                    if let Some(name) = &sel_name {
-                        if self.fs.input.trim().is_empty() {
-                            self.fs.status = String::from("Введите новое имя.");
-                            self.fs.failed = true;
-                        } else {
-                            let from = fs_join(&self.fs.path, name);
-                            let to = fs_join(&self.fs.path, self.fs.input.trim());
-                            match fs_call::<String>(Request::FsRename { from, to }) {
-                                Ok(_) => {
-                                    self.fs.sel = None;
-                                    fs_reload(&mut self.fs);
-                                }
-                                Err(e) => {
-                                    self.fs.status = e;
-                                    self.fs.failed = true;
-                                }
-                            }
-                        }
-                    }
-                }
-                if ui.add_enabled(has_sel, egui::Button::new("✕ Удалить")).clicked() {
-                    if let Some(name) = sel_name {
-                        let path = fs_join(&self.fs.path, &name);
-                        match fs_call::<String>(Request::FsDelete { path }) {
-                            Ok(_) => {
-                                self.fs.sel = None;
-                                fs_reload(&mut self.fs);
-                            }
-                            Err(e) => {
-                                self.fs.status = e;
-                                self.fs.failed = true;
-                            }
-                        }
-                    }
-                }
-            },
-            );
-            ui.separator();
-
-            // ── Слева список каталога, справа редактор ──
-            //
-            // Обе панели обёрнуты в `with_layout(top_down)`: дочерний ui наследует
-            // раскладку родителя, а родитель — горизонтальный ряд, и имена леглись
-            // бы в одну строку, тянув окно на 1430 px. `max_width` не спасает: он
-            // применяется до измерения контента, а при `auto_shrink[0] = false`
-            // итоговая ширина = max(доступная, контент).
-            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), PANE_H), egui::Layout::left_to_right(egui::Align::Min), |ui| {
-                egui::ScrollArea::vertical()
-                    .id_source("fs_list")
-                    .max_width(230.0)
-                    .auto_shrink([true, true])
-                    .show(ui, |ui| {
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            // Выбранная запись не открывается прямо здесь: заимствование
-                            // entries закончилось бы только с циклом, а fs_enter/
-                            // fs_open_file берут &mut FsExplorer целиком.
-                            let mut enter: Option<String> = None;
-                            let mut open: Option<String> = None;
-                            for e in &self.fs.entries {
-                                let glyph = if e.is_dir { "▸" } else { "·" };
-                                let selected = self.fs.sel.as_deref() == Some(e.name.as_str());
-                                let resp = ui.selectable_label(selected, format!("{} {}", glyph, e.name));
-                                if resp.clicked() {
-                                    self.fs.sel = Some(e.name.clone());
-                                }
-                                if resp.double_clicked() {
-                                    if e.is_dir {
-                                        enter = Some(e.name.clone());
-                                    } else {
-                                        open = Some(e.name.clone());
-                                    }
-                                }
-                            }
-                            if let Some(d) = enter {
-                                fs_enter(&mut self.fs, &d);
-                            }
-                            if let Some(f) = open {
-                                fs_open_file(&mut self.fs, &f);
-                            }
-                        });
-                    });
-
-                ui.separator();
-                // vertical(): длинные строки переносятся, а не скроллятся вбок —
-                // та же схема, что у терминала, которая доказанно держит своё
-                // окно в 600 px. auto_shrink по X выключен, чтобы редактор
-                // занимал весь остаток ряда, а не сжимался под текст.
-                egui::ScrollArea::vertical()
-                    .id_source("fs_code")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                            ui.horizontal(|ui| {
-                                let (title, color) = if self.fs.file.is_empty() {
-                                    (
-                                        String::from("— файл не открыт —"),
-                                        egui::Color32::from_rgb(130, 130, 135),
-                                    )
-                                } else if self.fs.dirty {
-                                    (format!("● {} *", self.fs.file), egui::Color32::from_rgb(255, 170, 60))
-                                } else {
-                                    (
-                                        self.fs.file.clone(),
-                                        egui::Color32::from_rgb(130, 130, 135),
-                                    )
-                                };
-                                ui.colored_label(color, title);
-                                if ui
-                                    .add_enabled(!self.fs.file.is_empty(), egui::Button::new("SAVE"))
-                                    .clicked()
-                                {
-                                    fs_save(&mut self.fs);
-                                }
-                            });
-                            // desired_rows — минимум высоты: без него окно
-                            // схлопывалось бы до пары строк, когда в каталоге
-                            // два файла, и редактором было бы нечем пользоваться.
-                            let editor = ui.add(
-                                egui::TextEdit::multiline(&mut self.fs.code)
-                                    .code_editor()
-                                    .desired_rows(14)
-                                    .desired_width(f32::INFINITY),
-                            );
-                            if editor.changed() {
-                                self.fs.dirty = true;
-                            }
-                        });
-                    });
-
-                // Высота ряда задана явно (PANE_H) в allocate_ui_with_layout выше.
-                // allocate_space(vec2(0.0, _)) тут был бы ошибкой: в left_to_right
-                // он кладёт нулевой прямоугольник на 8 px правее края, min_rect рос
-                // на 8 px каждый кадр, пока окно не упиралось в экран.
-            },
-            );
-
-            // ── Статус: зелёный на успехе, красный на ошибке ядра ──
-            ui.separator();
-            let color = if self.fs.failed {
-                egui::Color32::from_rgb(255, 96, 96)
-            } else {
-                egui::Color32::from_rgb(0, 220, 90)
-            };
-            ui.colored_label(color, self.fs.status.as_str());
-        });
-    }
-
     /// Очистка чата: сбрасывает буфер вывода и память диалога (как /reset) и снимает
     /// маркер стрима, иначе следующий Delta перезаписал бы уже пустой буфер по старому смещению.
     fn clear_chat(&mut self) {
@@ -1679,6 +1276,40 @@ impl VanguardOSApp {
         }
     }
 
+    /// Отправляет компиляцию Rust в ядро и возвращает управление сразу: `rustc -O`
+    /// занимает секунды и единственный из действий ИИ замораживает рендер. Поток
+    /// отдельный, `bg_tasks` держит кадр живым до `AiEvent::ActionOutput`.
+    ///
+    /// Истории диалога сразу отдаём заглушку — сама компиляция в неё не попадает,
+    /// иначе медленный `rustc` встал бы в историю уже после новой реплики, а писать
+    /// финальный ответ в чат в разгар нового стрима нельзя: маркер бы его перетёр.
+    fn dispatch_rust_compile(&mut self, description: &str, code: String) {
+        let gen_id: u32 = rand::thread_rng().gen_range(100..1000);
+        let ack = format!(
+            ">> [ИИ] {}\n>> Компиляция Rust ушла в ядро (vanguard_core), ждём...\n",
+            description
+        );
+        self.shell.ai_core.push_assistant(&ack);
+        self.ai_text_area.push_str(&ack);
+
+        let tx = self.ai_event_tx.clone();
+        let bg = Arc::clone(&self.shell.bg_tasks);
+        bg.fetch_add(1, Ordering::SeqCst);
+        // Всё клонируется до spawn: замыкание уходит в 'static-поток, а
+        // description — ссылка на локальный action вызывающего.
+        let description = description.to_string();
+        std::thread::spawn(move || {
+            let request = serde_json::to_string(&Request::CompileRust {
+                code,
+                description,
+                gen_id,
+            })
+            .unwrap_or_default();
+            let reply = crate::ipc_client::call(&request);
+            let _ = tx.send(AiEvent::ActionOutput(reply.text));
+            bg.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
 
     pub fn check_ai_stream(&mut self) {
         // Дренажим канал всегда, а не только пока идёт ответ ИИ: иначе лог
@@ -1711,39 +1342,10 @@ impl VanguardOSApp {
                     if let Some(marker) = self.ai_stream_marker.take() {
                         self.ai_text_area.truncate(marker);
                     }
-                    // Компиляция Rust (`rustc -O`, секунды) — единственная операция,
-                    // которая реально замораживает рендер, поэтому едет в ядро.
-                    // Истории сразу отдаём заглушку: результат придёт позже
-                    // ActionOutput-ом, а писать финальный ответ в разгар нового
-                    // запроса нельзя — маркер бы его перетёр.
+                    // Компиляция Rust уходит в ядро: rustc -O занимает секунды.
                     if let VanguardAction::CreateScript { language, code, description } = &action {
                         if language.eq_ignore_ascii_case("rust") {
-                            let gen_id: u32 = rand::thread_rng().gen_range(100..1000);
-                            let ack = format!(
-                                ">> [ИИ] {}\n>> Компиляция Rust ушла в ядро (vanguard_core), ждём...\n",
-                                description
-                            );
-                            self.shell.ai_core.push_assistant(&ack);
-                            self.ai_text_area.push_str(&ack);
-
-                            let tx = self.ai_event_tx.clone();
-                            let bg = Arc::clone(&self.shell.bg_tasks);
-                            bg.fetch_add(1, Ordering::SeqCst);
-                            // Клонируем до spawn: замыкание уходит в 'static-поток,
-                            // а code/description — ссылки на локальный action.
-                            let code = code.clone();
-                            let description = description.clone();
-                            std::thread::spawn(move || {
-                                let request = serde_json::to_string(&Request::CompileRust {
-                                    code,
-                                    description,
-                                    gen_id,
-                                })
-                                .unwrap_or_default();
-                                let reply = crate::ipc_client::call(&request);
-                                let _ = tx.send(AiEvent::ActionOutput(reply.text));
-                                bg.fetch_sub(1, Ordering::SeqCst);
-                            });
+                            self.dispatch_rust_compile(description, code.clone());
                             continue;
                         }
                     }

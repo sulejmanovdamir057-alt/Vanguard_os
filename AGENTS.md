@@ -90,10 +90,10 @@ The wiring spans several places and is easy to half-break:
   window that is closed by default — so nothing repaints while idle. `update()` therefore
   calls `ctx.request_repaint()` whenever `is_ai_streaming || shell.bg_tasks > 0`. Drop that
   guard and AI streaming plus `/run` output stall until the next mouse move.
-- Responses are **SSE-streamed**: the body carries `"stream": true`, and `spawn_ai_request`
-  walks `data:` lines off `Body::into_reader()` (ureq `BodyReader: io::Read`), accumulating
-  `choices[0].delta.content` until `data: [DONE]`. Verified shape on Ollama: `data: {json}`
-  separated by blank lines, terminator `data: [DONE]`.
+- Responses are **SSE-streamed**: the body carries `"stream": true`, and `stream_sse`
+  (called from `spawn_ai_request`) walks `data:` lines off `Body::into_reader()`
+  (ureq `BodyReader: io::Read`), accumulating `choices[0].delta.content` until `data: [DONE]`.
+  Verified shape on Ollama: `data: {json}` separated by blank lines, terminator `data: [DONE]`.
 - Each change emits `AiEvent::Delta(preview)` where `preview` is the **full** current text, not
   an increment — so the UI rewrites its region from scratch every time and a lost chunk costs
   nothing. `extract_preview` (`ai_core.rs`) cannot use `serde_json`: the object only becomes
@@ -137,11 +137,15 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
   Single source of truth for the wire format. Add a request here first, then a handler in
   `bin/core.rs`, then a caller. The `Fs*` requests (file explorer) also carry their payload
   types here (`FsEntry`/`FsListing`/`FsFile`) — see the sandbox section below.
-- `src/ai_core.rs` — `spawn_ai_request`: env config, SSE streaming reader, `extract_preview`,
-  plus the `VanguardAction` JSON protocol. Non-2xx does not reach here as an error (the agent
-  is built with `http_status_as_error(false)`), the status is checked before parsing. Lives in
-  the lib because the future `vanguard_ai` assistant will reuse it; the shell calls it over an
-  in-process channel, not IPC.
+- `src/ai_core.rs` — the AI request, split into three: `build_request` (env config, message
+  assembly, body — **pure, no I/O**, returns `Err(String)` instead of sending events),
+  `spawn_ai_request` (thread, agent, POST, non-2xx check) and `stream_sse` (the SSE reader),
+  plus `extract_preview` and the `VanguardAction` JSON protocol. Non-2xx does not reach here as
+  an error (the agent is built with `http_status_as_error(false)`), the status is checked
+  before parsing. Both error paths now `return Err` and the caller sends `AiEvent::Error` —
+  **neither sends `Finished`**, which is exactly what they did when they sent the event
+  themselves; do not "fix" that into a `Finished`. Lives in the lib because the future
+  `vanguard_ai` assistant will reuse it; the shell calls it over an in-process channel, not IPC.
 - `src/core/shell.rs` — `VanguardShell::handle_command` parses `/…` and returns a `ShellAction`;
   `execute_ai_action` carries out AI-requested work. Still called from the shell's
   `check_ai_stream`, but its `/run` and `rustc` paths are now also reachable through the core
@@ -164,10 +168,21 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
   (grouped in `VanguardWindows`), the AI stream, the IPC client calls, and the command input
   entrypoint (`send_ai_query`). The desktop itself was extracted to `desktop.rs`; `app.rs` only
   builds a `DesktopHost` each frame and executes the returned `DesktopIntent`s via
-  `apply_desktop_intent`. It also holds `FsExplorer` (state of the "Файлы" window) and its
-  IPC helpers `fs_call`/`fs_reload`/`fs_open_file`/`fs_save` — free functions, not methods,
-  because the window calls them from inside `show()` where `&mut self` is already taken by
-  the window itself (same trick as `walk_history`).
+  `apply_desktop_intent`. It still owns the `fs: FsExplorer` field; every line behind that
+  field lives in the child module right below.
+- `src/app/fs_explorer.rs` — the "Файлы" window: `FsExplorer`, the `fs_*` IPC helpers and
+  `draw_fs_window`, itself split into five free functions (`fs_row_path`, `fs_row_actions`,
+  `fs_panes`, `fs_row_status`; the two panes live inside `fs_panes`) over three shared ones:
+  `fs_apply`, `fs_named_input`, `fs_btn_create`. They exist because the same
+  `match fs_call { Ok => reload, Err => status }` appeared **four** times, the empty-name check
+  **three** times and a near-identical create button **twice** — behaviour now changes once.
+  - **It is a child module of `app`, not a sibling:** `mod fs_explorer;` is declared *inside*
+    `app.rs`, which resolves to `src/app/fs_explorer.rs`. Private fields of `VanguardOSApp` are
+    visible only in the declaring module **and its descendants**, so a sibling registered in
+    `main.rs` would need `pub(crate)` on every field it touches.
+  - The helpers stay **free functions taking `&mut FsExplorer`**, not methods: the window calls
+    them from inside `VanguardWindow::show()`, where `&mut self` is already taken by the window
+    itself (same trick as `walk_history`).
 - `src/ipc_client.rs` — the shell's side of IPC: `call()` connects, autostarts `vanguard_core.exe`
   if nothing is listening (3 s of retries, spawned with `CREATE_NO_WINDOW`), sends one request,
   and reads responses **until a final `Ok`/`Err`/`Pong`** — see the warning below.
@@ -282,7 +297,8 @@ Widgets and features added on top of the original desktop:
   not desktop surface.
 - **File Explorer** (`self.windows.explorer`, «Файлы»): a real directory tree served by the core
   over IPC — **the shell never touches the filesystem here** (no `std::fs` anywhere in
-  `draw_fs_window`). Its state is one `FsExplorer` struct on `VanguardOSApp`, and its IPC helpers
+  `draw_fs_window`) — the whole feature now lives in the child module `src/app/fs_explorer.rs`.
+  Its state is one `FsExplorer` struct on `VanguardOSApp`, and its IPC helpers
   `fs_call`/`fs_reload`/`fs_leave`/`fs_up`/`fs_enter`/`fs_open_file`/`fs_save` are **free functions,
   not methods** — the same trick as `walk_history`: they run inside `VanguardWindow::show`'s
   closure, where `&mut self` is already taken by the window itself, and only `self.fs` is

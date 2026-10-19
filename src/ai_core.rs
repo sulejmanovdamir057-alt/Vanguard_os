@@ -73,97 +73,130 @@ pub fn configured_model() -> String {
         .unwrap_or_else(|_| "qwen3.5:9b".to_string())
 }
 
-pub fn spawn_ai_request(
+/// Готовый запрос к бэкенду: куда, под каким ключом и с каким телом.
+///
+/// Модель в поле живёт только ради строки лога `CORE LNK` — в тело она уже попала.
+struct AiHttpRequest {
+    model: String,
+    url: String,
+    key: String,
+    body: String,
+}
+
+/// Всё, что можно посчитать **без сети**: конфигурация из env, собеседование
+/// (system + история + свежий вопрос) и тело запроса.
+///
+/// Вынесено из [`spawn_ai_request`], чтобы хрупкие места проверялись отдельно:
+/// здесь живут обе ловушки конфигурации — `keep_alive` числом против строки и
+/// `reasoning_effort` — а чтение env не переплетается с сетью. Функция чистая и
+/// возвращает `Err` строкой вместо того, чтобы самой слать `AiEvent::Error`.
+///
+/// Диалог собирается как `[system, ...история..., user]`. system всегда первый и свежий:
+/// промпт личности задаёт JSON-протокол, и модель должна видеть его в конце контекста,
+/// а не вычитывать из собственных старых реплик.
+fn build_request(
     user_prompt: String,
     // Предыдущие реплики в порядке возрастания. Без этого аргумента запрос состоял из
     // [system, user] и модель не помнила предыдущих сообщений (см. VanguardAI::messages).
+    history: Vec<(String, String)>,
+    personality: &DronePersonality,
+) -> Result<AiHttpRequest, String> {
+    let system_prompt = personality.generate_system_prompt();
+
+    // Конфигурация бэкенда — только через env, хардкода URL/ключа больше нет.
+    // Дефолт: локальная Ollama (OpenAI-совместимый /v1/chat/completions), ключ ей не нужен.
+    // Проверено на этой машине (реальный системный промпт, 3 запроса): и 7b, и 32b
+    // отвечают валидным VanguardAction JSON — ТОЛЬКО если промпт перечисляет все три типа
+    // действий. Без примера SystemCommand 7b выдумывал action_type "SystemCheck", и ответ
+    // падал в TextResponse-фолбэк как сырой JSON. 32b угадывал и без подсказки, но стоит
+    // ~12-24 с на ответ против ~0.5 с у 7b — см. раздел про VRAM ниже.
+    let url = configured_url();
+    // qwen3.5:9b (6.6 ГБ) целиком помещается в 12 ГБ VRAM RTX 3080 Ti, как и 7b.
+    // 32b (21 ГБ) — нет: половина слоёв уходила на CPU и это давало ~6 tok/s вместо десятков.
+    // Модель гибридная: thinking у неё включено по умолчанию и стоит 18-44 с на ответ.
+    // См. развёрнутый замер у тела запроса ниже — VANGUARD_AI_REASONING_EFFORT=none
+    // возвращает скорость ~0.5-1.6 с ценой отсутствия размышлений.
+    let model = configured_model();
+    let api_key = std::env::var("VANGUARD_AI_KEY").unwrap_or_else(|_| "ollama".to_string());
+    // Ollama выгружает модель по таймауту простоя и грузит её заново при следующем
+    // запросе. "30m" покрывают обычный ритм работы; "-1" — не выгружать никогда.
+    // Ловушка: "-1" работает только как ЧИСЛО — строку "-1" Ollama 0.40 отклоняет
+    // с 400 "time: missing unit in duration", поэтому числовые значения (секунды,
+    // включая -1) превращаем в JSON-число, а сроки вроде "30m" оставляем строкой.
+    let keep_alive_raw = std::env::var("VANGUARD_AI_KEEP_ALIVE")
+        .unwrap_or_else(|_| "30m".to_string());
+    let keep_alive: serde_json::Value = match keep_alive_raw.parse::<i64>() {
+        Ok(secs) => serde_json::json!(secs),
+        Err(_) => serde_json::Value::String(keep_alive_raw),
+    };
+
+    let mut messages = vec![serde_json::json!({"role": "system", "content": system_prompt})];
+    for (role, content) in &history {
+        messages.push(serde_json::json!({"role": role, "content": content}));
+    }
+    messages.push(serde_json::json!({"role": "user", "content": user_prompt}));
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        // response_format заставляет модель выдавать СТРОГО валидный JSON, который мы просили в промпте
+        "response_format": { "type": "json_object" },
+        // stream:true — Ollama отдаёт SSE-поток, ответ виден в чате уже по мере генерации
+        "stream": true,
+        // не выгружать модель сразу после простоя (см. keep_alive выше)
+        "keep_alive": keep_alive
+    });
+
+    // Гибридные модели (qwen3.*) сливают бюджет в thinking. Замерено на этом эндпоинте
+    // для qwen3.5:9b на реальном 3-промптовом стенде протокола (wall / completion_tokens):
+    //   "reasoning_effort":"none" -> 0.51 / 0.99 / 1.57 s, 18-91 токенов
+    //   "low"                     -> 15.4 / 28.0 / 38.5 s, 1457-3658 токенов
+    //   без параметра (полный)    -> 18-44 s
+    // Компромисса «чуть умнее, чуть медленнее» у этой модели нет: любое thinking стоит
+    // в 20-30 раз дороже. Сейчас оно ВКЛЮЧЕНО (переменная удалена из env, поле не шлётся) —
+    // протокол при thinking держится 3/3, а reasoning уходит в отдельное поле delta.reasoning
+    // и не попадает в content (проверено на реальном потоке), поэтому чат остаётся чистым.
+    // Единственная цена — ~350 пустых чанков до начала ответа: превью в чате молчит,
+    // пока модель думает. Поставьте VANGUARD_AI_REASONING_EFFORT=none, если нужна скорость.
+    // "none" принимается всеми моделями (7b и deepseek-r1 отвечают http 200), а вот "medium"
+    // на не-thinking модели даёт 400 "does not support thinking" — поэтому по умолчанию
+    // переменная пуста и поле не шлётся вовсе.
+    if let Ok(re) = std::env::var("VANGUARD_AI_REASONING_EFFORT") {
+        body["reasoning_effort"] = serde_json::Value::String(re);
+    }
+
+    let body = serde_json::to_string(&body)
+        .map_err(|e| format!("Ошибка сериализации промпта: {}", e))?;
+
+    Ok(AiHttpRequest { model, url, key: api_key, body })
+}
+
+/// Запускает запрос к бэкенду **в отдельном потоке** и шлёт события в канал.
+///
+/// Тело запроса уже посчитано — см. [`build_request`], разбор ответа отдан
+/// [`stream_sse`]. Здесь остаётся только сетевая часть: агент с таймаутами, POST
+/// и превращение результата в `AiEvent`.
+pub fn spawn_ai_request(
+    user_prompt: String,
     history: Vec<(String, String)>,
     personality: DronePersonality,
     ui_tx: Sender<AiEvent>,
 ) {
     thread::spawn(move || {
-        let system_prompt = personality.generate_system_prompt();
-
-        // Конфигурация бэкенда — только через env, хардкода URL/ключа больше нет.
-        // Дефолт: локальная Ollama (OpenAI-совместимый /v1/chat/completions), ключ ей не нужен.
-        // Проверено на этой машине (реальный системный промпт, 3 запроса): и 7b, и 32b
-        // отвечают валидным VanguardAction JSON — ТОЛЬКО если промпт перечисляет все три типа
-        // действий. Без примера SystemCommand 7b выдумывал action_type "SystemCheck", и ответ
-        // падал в TextResponse-фолбэк как сырой JSON. 32b угадывал и без подсказки, но стоит
-        // ~12-24 с на ответ против ~0.5 с у 7b — см. раздел про VRAM ниже.
-        let url = configured_url();
-        // qwen3.5:9b (6.6 ГБ) целиком помещается в 12 ГБ VRAM RTX 3080 Ti, как и 7b.
-        // 32b (21 ГБ) — нет: половина слоёв уходила на CPU и это давало ~6 tok/s вместо десятков.
-        // Модель гибридная: thinking у неё включено по умолчанию и стоит 18-44 с на ответ.
-        // См. развёрнутый замер у тела запроса ниже — VANGUARD_AI_REASONING_EFFORT=none
-        // возвращает скорость ~0.5-1.6 с ценой отсутствия размышлений.
-        let model = configured_model();
-        let api_key = std::env::var("VANGUARD_AI_KEY").unwrap_or_else(|_| "ollama".to_string());
-        // Ollama выгружает модель по таймауту простоя и грузит её заново при следующем
-        // запросе. "30m" покрывают обычный ритм работы; "-1" — не выгружать никогда.
-        // Ловушка: "-1" работает только как ЧИСЛО — строку "-1" Ollama 0.40 отклоняет
-        // с 400 "time: missing unit in duration", поэтому числовые значения (секунды,
-        // включая -1) превращаем в JSON-число, а сроки вроде "30m" оставляем строкой.
-        let keep_alive_raw = std::env::var("VANGUARD_AI_KEEP_ALIVE")
-            .unwrap_or_else(|_| "30m".to_string());
-        let keep_alive: serde_json::Value = match keep_alive_raw.parse::<i64>() {
-            Ok(secs) => serde_json::json!(secs),
-            Err(_) => serde_json::Value::String(keep_alive_raw),
-        };
+        let AiHttpRequest { url, model, key: api_key, body: json_body } =
+            match build_request(user_prompt, history, &personality) {
+                Ok(req) => req,
+                Err(msg) => {
+                    let _ = ui_tx.send(AiEvent::Error(msg));
+                    return;
+                }
+            };
 
         // Лог инициализации: показываем реальный эндпоинт, чтобы видеть битый конфиг сразу
         let _ = ui_tx.send(AiEvent::Token(format!(
             ">> CORE LNK: endpoint={} model={}\n", url, model
         )));
 
-        // Диалог собирается как [system, ...история..., user]. system всегда первый и свежий:
-        // промпт личности задаёт JSON-протокол, и модель должна видеть его в конце контекста,
-        // а не вычитывать из собственных старых реплик.
-        let mut messages = vec![serde_json::json!({"role": "system", "content": system_prompt})];
-        for (role, content) in &history {
-            messages.push(serde_json::json!({"role": role, "content": content}));
-        }
-        messages.push(serde_json::json!({"role": "user", "content": user_prompt}));
-
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            // response_format заставляет модель выдавать СТРОГО валидный JSON, который мы просили в промпте
-            "response_format": { "type": "json_object" },
-            // stream:true — Ollama отдаёт SSE-поток, ответ виден в чате уже по мере генерации
-            "stream": true,
-            // не выгружать модель сразу после простоя (см. keep_alive выше)
-            "keep_alive": keep_alive
-        });
-
-        // Гибридные модели (qwen3.*) сливают бюджет в thinking. Замерено на этом эндпоинте
-        // для qwen3.5:9b на реальном 3-промптовом стенде протокола (wall / completion_tokens):
-        //   "reasoning_effort":"none" -> 0.51 / 0.99 / 1.57 s, 18-91 токенов
-        //   "low"                     -> 15.4 / 28.0 / 38.5 s, 1457-3658 токенов
-        //   без параметра (полный)    -> 18-44 s
-        // Компромисса «чуть умнее, чуть медленнее» у этой модели нет: любое thinking стоит
-        // в 20-30 раз дороже. Сейчас оно ВКЛЮЧЕНО (переменная удалена из env, поле не шлётся) —
-        // протокол при thinking держится 3/3, а reasoning уходит в отдельное поле delta.reasoning
-        // и не попадает в content (проверено на реальном потоке), поэтому чат остаётся чистым.
-        // Единственная цена — ~350 пустых чанков до начала ответа: превью в чате молчит,
-        // пока модель думает. Поставьте VANGUARD_AI_REASONING_EFFORT=none, если нужна скорость.
-        // "none" принимается всеми моделями (7b и deepseek-r1 отвечают http 200), а вот "medium"
-        // на не-thinking модели даёт 400 "does not support thinking" — поэтому по умолчанию
-        // переменная пуста и поле не шлётся вовсе.
-        if let Ok(re) = std::env::var("VANGUARD_AI_REASONING_EFFORT") {
-            body["reasoning_effort"] = serde_json::Value::String(re);
-        }
-
-        // 1. Сериализуем тело запроса в строку силами serde_json
-        let json_body = match serde_json::to_string(&body) {
-            Ok(json) => json,
-            Err(e) => {
-                let _ = ui_tx.send(AiEvent::Error(format!("Ошибка сериализации промпта: {}", e)));
-                return;
-            }
-        };
-
-        // 2. Отправка реального сетевого запроса через правильный синтаксис ureq 3.x
         // Таймаут обязателен: у ureq 3.4.2 по умолчанию ВСЕ таймауты = None, поэтому зависший
         // запрос навсегда оставил бы is_ai_streaming = true в UI и блокировал терминал.
         // 120с: модель на 7b грузится за секунды, а лишние минуты ожидания здесь — это
@@ -199,50 +232,14 @@ pub fn spawn_ai_request(
                     return;
                 }
 
-                // Разбор SSE: строки `data: {json}`, разделённые пустой строкей,
-                // завершаются терминатором `data: [DONE]`. Проверено на Ollama.
-                let mut accumulated = String::new(); // весь content, как его собрала модель
-                let mut shown = String::new();       // что уже ушло в чат
-                let mut line = String::new();
-
-                loop {
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => break, // поток закрыт сервером
-                        Ok(_) => {}
-                        Err(e) => {
-                            let _ = ui_tx.send(AiEvent::Error(format!("Ошибка чтения потока ИИ: {}", e)));
-                            return;
-                        }
+                // Разбор потока — отдельная функция: протокол Ollama проверяется сам по себе.
+                let accumulated = match stream_sse(&mut reader, &ui_tx) {
+                    Ok(text) => text,
+                    Err(msg) => {
+                        let _ = ui_tx.send(AiEvent::Error(msg));
+                        return;
                     }
-
-                    let trimmed = line.trim();
-                    if !trimmed.starts_with("data:") {
-                        continue; // пустая строка-разделитель
-                    }
-                    let payload = trimmed[5..].trim();
-                    if payload == "[DONE]" {
-                        break;
-                    }
-
-                    let chunk: serde_json::Value = match serde_json::from_str(payload) {
-                        Ok(v) => v,
-                        Err(_) => continue, // один битый чанк не должен ронять весь ответ
-                    };
-                    if let Some(piece) = chunk["choices"][0]["delta"]["content"].as_str() {
-                        if piece.is_empty() {
-                            continue;
-                        }
-                        accumulated.push_str(piece);
-
-                        // В чат идёт текст ответа, а не собирающаяся JSON-оболочка
-                        let preview = extract_preview(&accumulated);
-                        if preview != shown {
-                            shown = preview.clone();
-                            let _ = ui_tx.send(AiEvent::Delta(preview));
-                        }
-                    }
-                }
+                };
 
                 if accumulated.is_empty() {
                     let _ = ui_tx.send(AiEvent::Error("Бэкенд не вернул ни одного токена".to_string()));
@@ -267,6 +264,57 @@ pub fn spawn_ai_request(
         }
         let _ = ui_tx.send(AiEvent::Finished);
     });
+}
+
+/// Разбор SSE-потока Ollama: шлёт `AiEvent::Delta` по мере генерации и возвращает
+/// собранный JSON-ответ целиком.
+///
+/// Протокол проверен на реальной Ollama: строки `data: {json}` разделены пустой
+/// строкой и завершаются терминатором `data: [DONE]`. Битый чанк пропускается —
+/// один мусорный кусок не должен ронять весь ответ. Ошибка чтения возвращается
+/// строкой: слать `AiEvent::Error` и решать, падать ли дальше, — дело вызывающего.
+fn stream_sse<R: BufRead>(reader: &mut R, ui_tx: &Sender<AiEvent>) -> Result<String, String> {
+    let mut accumulated = String::new(); // весь content, как его собрала модель
+    let mut shown = String::new();       // что уже ушло в чат
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // поток закрыт сервером
+            Ok(_) => {}
+            Err(e) => return Err(format!("Ошибка чтения потока ИИ: {}", e)),
+        }
+
+        let trimmed = line.trim();
+        if !trimmed.starts_with("data:") {
+            continue; // пустая строка-разделитель
+        }
+        let payload = trimmed[5..].trim();
+        if payload == "[DONE]" {
+            break;
+        }
+
+        let chunk: serde_json::Value = match serde_json::from_str(payload) {
+            Ok(v) => v,
+            Err(_) => continue, // один битый чанк не должен ронять весь ответ
+        };
+        if let Some(piece) = chunk["choices"][0]["delta"]["content"].as_str() {
+            if piece.is_empty() {
+                continue;
+            }
+            accumulated.push_str(piece);
+
+            // В чат идёт текст ответа, а не собирающаяся JSON-оболочка
+            let preview = extract_preview(&accumulated);
+            if preview != shown {
+                shown = preview.clone();
+                let _ = ui_tx.send(AiEvent::Delta(preview));
+            }
+        }
+    }
+
+    Ok(accumulated)
 }
 
 /// Вытаскивает из (возможно ещё неполного) JSON-объекта то, что модель уже успела
