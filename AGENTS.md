@@ -24,6 +24,20 @@ and froze the render for seconds. Everything else stayed in the shell because it
 
 ## Commands
 
+- `. "$env:TEMP\opencode\psinit.ps1"` — **put this at the top of every shell call.** One line that
+  dot-sources the tracked `tools/psinit.ps1` through a throwaway stub in `%TEMP%`, and buys:
+  UTF-8 for the console **and** for `$OutputEncoding` (otherwise `Пользователь` comes back as
+  mojibake, and any Russian text sent to a native command down a pipeline becomes `?`),
+  `%TEMP%` expanded out of its 8.3 short form, `Set-Location` into the repo, and the shortcuts
+  `vg check|build|smoke|run|core|kill|all`, `vgkill`, `gst`, `glg [n]`.
+  - It exists because the harness runs `powershell -NoProfile`, so `$PROFILE` is never read —
+    do not "fix" this by adding things there instead.
+  - **Every `.ps1` under `tools/` must stay ASCII-only.** PS 5.1 reads a script *without a BOM*
+    using the ANSI codepage (cp1251 here), so one Cyrillic character anywhere — even in a
+    comment — is `ParserError: TerminatorExpectedAtEndOfString`, not a cosmetic glitch. That is
+    why `psinit.ps1` builds the repo path at runtime with
+    `Join-Path ([Environment]::GetFolderPath('UserProfile')) ...` instead of writing the user
+    name out, and why `fs_smoke.ps1` never quotes Russian error strings.
 - `powershell -File tools\dev.ps1 <check|build|smoke|run|core|kill|all>` — **use this instead of
   calling cargo by hand.** One call kills the stray `vanguard_os`/`vanguard_core` (they lock
   `target\debug\*.exe`), runs cargo with stdout/stderr redirected to files, prints every

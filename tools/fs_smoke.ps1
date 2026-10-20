@@ -126,7 +126,7 @@ Check 'C:\zzz_probe was not created' (-not (Test-Path -LiteralPath 'C:\zzz_probe
 # NB: in this shell $env:TEMP is an 8.3 short name (C:\Users\73B5~1\...), while
 # the core echoes back the canonical long path. Every path assertion below
 # compares against what the core echoes, so take the canonical form FROM the
-# core instead of from the environment — otherwise the comparison fails on
+# core instead of from the environment - otherwise the comparison fails on
 # cosmetic differences and says nothing about the code.
 $scratchShort = Join-Path $env:TEMP 'opencode_fs_smoke'
 if (Test-Path -LiteralPath $scratchShort) { Remove-Item -LiteralPath $scratchShort -Recurse -Force }
@@ -155,7 +155,7 @@ $f2 = Join-Path $scratch 'b.txt'
 Check 'fs_rename moves it' ((Invoke-Req @{ cmd = 'fs_rename'; from = $f1; to = $f2 }).kind -eq 'ok') 'rename failed'
 Check 'source is gone' (-not (Test-Path -LiteralPath $f1)) 'still there'
 $f3 = Join-Path $scratch 'c.txt'
-# Occupied target needs the victim to exist first — create it, then try to
+# Occupied target needs the victim to exist first - create it, then try to
 # move b.txt on top of c.txt. std::fs::rename would replace it silently.
 Check 'fs_create makes the second file' ((Invoke-Req @{ cmd = 'fs_create'; path = $f3 }).kind -eq 'ok') 'create failed'
 Check 'fs_rename refuses occupied target' ((Invoke-Req @{ cmd = 'fs_rename'; from = $f2; to = $f3 }).kind -eq 'err') 'replaced target'
