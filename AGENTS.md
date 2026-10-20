@@ -120,6 +120,34 @@ time is the **number of round trips**, so the rules below are about calls, not s
 `cargo check --all-targets` is the only verification (`cargo test` finds nothing), so the
 fastest correct loop is: edit → `vg check` → `vg publish`.
 
+### Installed tooling — gh 2.102.0, jq 1.8.2, hyperfine 2.0.0 (2026-10-20)
+
+All three via `winget --scope user`. None of them is visible to a shell that started before
+they were installed; refresh the path first:
+
+```powershell
+$env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+```
+
+**Every quoted argument must go through `q`.** PS 5.1 strips embedded double quotes when it
+builds a native command line, so `& jq -r ".models[] | .name"` reaches jq truncated at the
+first `"`, and `hyperfine "cargo check --all-targets"` fails the same way. Both work through `q`:
+
+```powershell
+. "$env:TEMP\opencode\psinit.ps1"
+q '. "$env:TEMP\opencode\psinit.ps1"; curl.exe -s http://localhost:11434/api/ps | jq -r ''.models[]? | .name'''
+```
+
+Measured with hyperfine (1 warmup, 3 runs): `cargo check --all-targets` = **398.6 ms ± 9.1 ms** —
+the 0.42 s Stopwatch figure above, now with a spread.
+
+`gh` is installed but **not authenticated**: `gh auth login` is a browser flow and has to be run
+by hand. Until then nothing gh-shaped works — no releases, and the duplicate `Vanguard_os_`
+repository stays, since deleting it needs a `delete_repo` scope the current token lacks.
+
+Avoid `Test-NetConnection` inside scripts: it dumps CLIXML progress records to stderr. Prefer
+`curl.exe -s -o NUL -w "%{http_code}"` or a raw `TcpClient`.
+
 ## No console output
 
 Progress in the GUI is shown **only** in the chat (`ai_text_area`); the boot banner and the
