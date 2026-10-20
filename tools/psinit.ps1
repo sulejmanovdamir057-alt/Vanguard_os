@@ -38,9 +38,10 @@ $VG = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'RustroverProjects
 Set-Location $VG
 
 # vg check|build|smoke|run|core|kill|all  -- see tools\dev.ps1
+# Runs under pwsh 7; the scripts themselves stay Windows PowerShell 5.1-clean.
 function vg {
     param([Parameter(Position = 0)][string]$step = 'check')
-    & powershell -NoProfile -File (Join-Path $VG 'tools\dev.ps1') $step @args
+    & pwsh -NoProfile -File (Join-Path $VG 'tools\dev.ps1') $step @args
 }
 
 function vgkill {
@@ -51,3 +52,23 @@ function vgkill {
 # git in one word instead of three.
 function gst { & git status --short }
 function glg { param([int]$n = 12) & git log --oneline "-$n" }
+
+# Run a snippet under PowerShell 7.
+#
+# Handing a script to pwsh.exe as `-Command '<text>'` loses every embedded
+# double quote: PS 5.1 does not escape them when building the native command
+# line, so pwsh receives `Write-Output (ver = )` and dies on "ver is not
+# recognized". -EncodedCommand takes base64 of UTF-16LE instead, which has no
+# quoting layer at all - no quote stripping, and Cyrillic survives byte-exact.
+#
+#   q '. "$env:TEMP\opencode\psinit.ps1"; vg build'
+#
+# Single-quoted at the call site, so the double quotes inside are literal text
+# for 5.1 and real quotes for pwsh.
+function q {
+    param([Parameter(Position = 0, ValueFromPipeline = $true)][string]$code)
+    process {
+        $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+        & pwsh -NoProfile -EncodedCommand $b64
+    }
+}

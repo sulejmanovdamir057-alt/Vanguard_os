@@ -29,7 +29,23 @@ and froze the render for seconds. Everything else stayed in the shell because it
   UTF-8 for the console **and** for `$OutputEncoding` (otherwise `Пользователь` comes back as
   mojibake, and any Russian text sent to a native command down a pipeline becomes `?`),
   `%TEMP%` expanded out of its 8.3 short form, `Set-Location` into the repo, and the shortcuts
-  `vg check|build|smoke|run|core|kill|all`, `vgkill`, `gst`, `glg [n]`.
+  `vg check|build|smoke|run|core|kill|all`, `vgkill`, `gst`, `glg [n]`, `q`.
+  - **To run a snippet under PowerShell 7, wrap it in `q`** — never call
+    `pwsh -Command '<text>'` directly. The outer shell is PS 5.1, which does not escape embedded
+    double quotes when it builds a native command line, so `pwsh -Command 'Write-Output ("x"+1)'`
+    arrives as `Write-Output (x+1)` and dies with *"x is not recognized"*. `q` base64-encodes the
+    snippet (`-EncodedCommand`) — no quoting layer at all, and Cyrillic survives byte-exact:
+    ```powershell
+    . "$env:TEMP\opencode\psinit.ps1"
+    q '. "$env:TEMP\opencode\psinit.ps1"; vg all'
+    ```
+    Note the prelude is dot-sourced **twice**: once for the outer 5.1 (which defines `q`), once
+    inside the pwsh snippet (which needs `vg` and the encoding fix). pwsh is **7.6.7**, a Store
+    install, so it is already newer than any 7.6.6 — do not "upgrade" it. It is *not* faster than
+    5.1 (638 ms vs 431 ms per process) and it does **not** fix Cyrillic by itself: it inherits
+    `cp866` from the parent console, and `chcp 65001` does not touch
+    `[Console]::OutputEncoding`. The prelude is what makes the output clean; `q` is for the
+    modern syntax and for scripts that need PS7 behaviour.
   - It exists because the harness runs `powershell -NoProfile`, so `$PROFILE` is never read —
     do not "fix" this by adding things there instead.
   - **Every `.ps1` under `tools/` must stay ASCII-only.** PS 5.1 reads a script *without a BOM*

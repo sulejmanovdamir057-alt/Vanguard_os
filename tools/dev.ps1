@@ -6,14 +6,14 @@
 # ends up 1. Everything below therefore redirects `>` and `2>` to *files* and
 # decides PASS/FAIL by reading them, never by trusting the merge.
 #
-# Usage:
-#   powershell -File tools\dev.ps1 check      cargo check --all-targets
-#   powershell -File tools\dev.ps1 build      cargo build (both binaries)
-#   powershell -File tools\dev.ps1 smoke      build + tools\fs_smoke.ps1
-#   powershell -File tools\dev.ps1 run        build + start the GUI from the repo root
-#   powershell -File tools\dev.ps1 core       build + start the core alone (no GUI)
-#   powershell -File tools\dev.ps1 kill       kill stray vanguard_os / vanguard_core
-#   powershell -File tools\dev.ps1 all        check + build + smoke
+# Usage (runs on Windows PowerShell 5.1 and on pwsh 7 - both verified):
+#   pwsh -File tools\dev.ps1 check      cargo check --all-targets
+#   pwsh -File tools\dev.ps1 build      cargo build (both binaries)
+#   pwsh -File tools\dev.ps1 smoke      build + tools\fs_smoke.ps1
+#   pwsh -File tools\dev.ps1 run        build + start the GUI from the repo root
+#   pwsh -File tools\dev.ps1 core       build + start the core alone (no GUI)
+#   pwsh -File tools\dev.ps1 kill       kill stray vanguard_os / vanguard_core
+#   pwsh -File tools\dev.ps1 all        check + build + smoke
 #
 # Exit code is truthful: 0 = clean, 1 = findings, 2 = missing binary.
 param(
@@ -93,8 +93,7 @@ switch ($cmd) {
         if (-not $keep) { Stop-Vanguard }
         $ok = Invoke-Cargo @('build')
         if ($ok -and (Build-Core)) {
-            & powershell -NoProfile -ExecutionPolicy Bypass `
-                -File (Join-Path $PSScriptRoot 'fs_smoke.ps1') -repo $repo
+            & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'fs_smoke.ps1') -repo $repo
             $ok = ($LASTEXITCODE -eq 0)
         } elseif ($ok) {
             $ok = $false
@@ -125,8 +124,7 @@ switch ($cmd) {
         $ok = Invoke-Cargo @('check', '--all-targets')
         if ($ok) { $ok = Invoke-Cargo @('build') }
         if ($ok -and (Build-Core)) {
-            & powershell -NoProfile -ExecutionPolicy Bypass `
-                -File (Join-Path $PSScriptRoot 'fs_smoke.ps1') -repo $repo
+            & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'fs_smoke.ps1') -repo $repo
             $ok = ($LASTEXITCODE -eq 0)
         } elseif ($ok) {
             $ok = $false
