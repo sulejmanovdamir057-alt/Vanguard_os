@@ -24,6 +24,20 @@ and froze the render for seconds. Everything else stayed in the shell because it
 
 ## Commands
 
+- `powershell -File tools\dev.ps1 <check|build|smoke|run|core|kill|all>` — **use this instead of
+  calling cargo by hand.** One call kills the stray `vanguard_os`/`vanguard_core` (they lock
+  `target\debug\*.exe`), runs cargo with stdout/stderr redirected to files, prints every
+  `error`/`warning:` line plus the elapsed time, and exits **truthfully** (0 = clean, 1 = findings).
+  `all` is the pre-commit gate: check + build + `tools\fs_smoke.ps1` (46 checks against the core
+  over raw TCP), ~10 s warm. `run` and `core` build first and then start the binary with the repo
+  root as CWD — remember the CWD rules below. `-keep` skips the kill step when the app must stay
+  open.
+  - It encodes the Windows trap below so you do not have to re-derive it: cargo writes
+    `Finished ...` to **stderr**, so `2>` under `$ErrorActionPreference='Stop'` raises
+    `NativeCommandError` on a *successful* build. `Invoke-Cargo` relaxes the preference for that
+    one line and decides by file content, not by the stream. Second half of the same trap:
+    `Write-Output` inside a function lands in the success stream and is swallowed by
+    `$ok = Invoke-Cargo ...` — progress lines must be `Write-Host`.
 - `cargo check` — the only fast verification. There are no tests, no lint/fmt/typecheck config,
   no CI, no codegen. `cargo test` finds nothing.
   - **On Windows, `cargo check 2>&1` from PowerShell exits with code 1 even on success**: `2>&1`
