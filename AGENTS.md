@@ -103,6 +103,23 @@ and froze the render for seconds. Everything else stayed in the shell because it
 than assuming this snapshot still holds. `ipc.rs` is the one file where a "harmless" edit breaks
 the wire silently — see the IPC section below.
 
+## Working efficiently here — measured, not assumed
+
+Compilation is **not** the bottleneck: `git status` 0.04 s, `cargo check` 0.42 s warm /
+1.9 s after a source edit, `cargo build` 3.8 s. All of it fits in one shell call. What costs
+time is the **number of round trips**, so the rules below are about calls, not seconds.
+
+| rule | why |
+|---|---|
+| batch independent tool calls into one block | edits to different files, `git` + `cargo`, scan + read — every separate call is another full reasoning pass |
+| one precise probe instead of three guesses | fixing the `pwsh -Command` quoting took three attempts where writing a file and running it once would have settled it; the em-dash hunt was the same shape |
+| `vg check` while iterating, `vg all`/`vg publish` only at the end | 0.42 s warm against a full gate with 46 smoke checks |
+| commit through `vg publish -m <msg> -- <paths>` | gate + `git add` + `git commit` in **one** call; the gate runs first, so an unbuildable tree cannot be committed |
+| no prose between steps of one task | intermediate reports are tokens, and tokens are the thing that is actually slow |
+
+`cargo check --all-targets` is the only verification (`cargo test` finds nothing), so the
+fastest correct loop is: edit → `vg check` → `vg publish`.
+
 ## No console output
 
 Progress in the GUI is shown **only** in the chat (`ai_text_area`); the boot banner and the

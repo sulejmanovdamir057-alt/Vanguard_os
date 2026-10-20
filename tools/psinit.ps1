@@ -37,11 +37,21 @@ try {
 $VG = Join-Path ([Environment]::GetFolderPath('UserProfile')) 'RustroverProjects\vanguard_os'
 Set-Location $VG
 
-# vg check|build|smoke|run|core|kill|all  -- see tools\dev.ps1
+# vg check|build|smoke|run|core|kill|all|publish  -- see tools\dev.ps1
 # Runs under pwsh 7; the scripts themselves stay Windows PowerShell 5.1-clean.
+# -m and the trailing paths are forwarded so `publish` needs no second entrypoint.
 function vg {
-    param([Parameter(Position = 0)][string]$step = 'check')
-    & pwsh -NoProfile -File (Join-Path $VG 'tools\dev.ps1') $step @args
+    param(
+        [Parameter(Position = 0)][string]$step = 'check',
+        [string]$m = '',
+        [switch]$keep,
+        [Parameter(ValueFromRemainingArguments = $true)][string[]]$rest
+    )
+    $call = @('-NoProfile', '-File', (Join-Path $VG 'tools\dev.ps1'), $step)
+    if ($m) { $call += @('-m', $m) }
+    if ($keep) { $call += '-keep' }
+    if ($rest) { $call += $rest }
+    & pwsh @call
 }
 
 function vgkill {

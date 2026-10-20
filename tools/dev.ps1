@@ -7,23 +7,38 @@
 # decides PASS/FAIL by reading them, never by trusting the merge.
 #
 # Usage (runs on Windows PowerShell 5.1 and on pwsh 7 - both verified):
-#   pwsh -File tools\dev.ps1 check      cargo check --all-targets
+#   pwsh -File tools\dev.ps1 check      cargo check --all-targets     (~0.4 s warm)
 #   pwsh -File tools\dev.ps1 build      cargo build (both binaries)
 #   pwsh -File tools\dev.ps1 smoke      build + tools\fs_smoke.ps1
 #   pwsh -File tools\dev.ps1 run        build + start the GUI from the repo root
 #   pwsh -File tools\dev.ps1 core       build + start the core alone (no GUI)
 #   pwsh -File tools\dev.ps1 kill       kill stray vanguard_os / vanguard_core
 #   pwsh -File tools\dev.ps1 all        check + build + smoke
+#   pwsh -File tools\dev.ps1 publish -m <msg> -- <paths...>
+#                                       gate, then git add + commit - one call
+#
+# `check` is the iteration loop (422 ms with nothing to do, 1.9 s after a source
+# edit - measured). `all` is the pre-commit gate. `publish` collapses the whole
+# "verify, stage, commit" sequence into one shell call; the gate runs first so
+# nothing unbuildable gets committed.
 #
 # Exit code is truthful: 0 = clean, 1 = findings, 2 = missing binary.
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('check', 'build', 'smoke', 'run', 'core', 'kill', 'all')]
+    [ValidateSet('check', 'build', 'smoke', 'run', 'core', 'kill', 'all', 'publish')]
     [string]$cmd,
 
     # `check`/`build`/`smoke` lock target\debug\*.exe, so stray processes are
     # killed first by default. -keep skips that when the app must stay open.
-    [switch]$keep
+    [switch]$keep,
+
+    # publish only. ASCII: arguments travel in cp1251 while git expects UTF-8,
+    # so a Russian message must go through `git commit -F <file>` instead.
+    [string]$m = '',
+
+    # publish only: paths to stage, placed after `--`.
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$paths
 )
 
 $ErrorActionPreference = 'Stop'
@@ -74,6 +89,16 @@ function Build-Core {
     return $true
 }
 
+# The pre-commit gate: check, build, smoke. Shared by `all` and `publish` so the
+# two can never drift apart.
+function Invoke-Gate {
+    if (-not (Invoke-Cargo @('check', '--all-targets'))) { return $false }
+    if (-not (Invoke-Cargo @('build'))) { return $false }
+    if (-not (Build-Core)) { return $false }
+    & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'fs_smoke.ps1') -repo $repo
+    return ($LASTEXITCODE -eq 0)
+}
+
 $ok = $true
 
 switch ($cmd) {
@@ -121,13 +146,28 @@ switch ($cmd) {
     }
     'all' {
         if (-not $keep) { Stop-Vanguard }
-        $ok = Invoke-Cargo @('check', '--all-targets')
-        if ($ok) { $ok = Invoke-Cargo @('build') }
-        if ($ok -and (Build-Core)) {
-            & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'fs_smoke.ps1') -repo $repo
-            $ok = ($LASTEXITCODE -eq 0)
-        } elseif ($ok) {
+        $ok = Invoke-Gate
+    }
+    'publish' {
+        if (-not $m) {
+            Write-Host 'FAIL  publish needs -m <message>'
             $ok = $false
+        } elseif (-not $paths -or $paths.Count -eq 0) {
+            Write-Host 'FAIL  publish needs paths after --'
+            $ok = $false
+        } else {
+            if (-not $keep) { Stop-Vanguard }
+            $ok = Invoke-Gate
+            if ($ok) {
+                & git add -- @paths
+                $ok = ($LASTEXITCODE -eq 0)
+            }
+            if ($ok) {
+                & git commit --quiet -m $m
+                $ok = ($LASTEXITCODE -eq 0)
+            }
+            if ($ok) { & git log --oneline -1 }
+            else { Write-Host 'FAIL  git add/commit - nothing was committed' }
         }
     }
 }
