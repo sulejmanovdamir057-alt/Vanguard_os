@@ -95,7 +95,12 @@ function Invoke-Gate {
     if (-not (Invoke-Cargo @('check', '--all-targets'))) { return $false }
     if (-not (Invoke-Cargo @('build'))) { return $false }
     if (-not (Build-Core)) { return $false }
-    & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'fs_smoke.ps1') -repo $repo
+    # The child's stdout lands in THIS function's success stream, and
+    # `$ok = Invoke-Gate` would swallow all 46 lines and keep only the verdict -
+    # the same trap as Write-Output inside Invoke-Cargo. Write-Host is the host
+    # stream, which no assignment can capture.
+    & pwsh -NoProfile -File (Join-Path $PSScriptRoot 'fs_smoke.ps1') -repo $repo |
+        ForEach-Object { Write-Host $_ }
     return ($LASTEXITCODE -eq 0)
 }
 
