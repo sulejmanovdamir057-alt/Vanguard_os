@@ -14,6 +14,7 @@
 #   pwsh -File tools\dev.ps1 core       build + start the core alone (no GUI)
 #   pwsh -File tools\dev.ps1 kill       kill stray vanguard_os / vanguard_core
 #   pwsh -File tools\dev.ps1 all        check + build + smoke
+#   pwsh -File tools\dev.ps1 clean       cargo clean + stale vanguard_* artifacts
 #   pwsh -File tools\dev.ps1 publish -m <msg> -- <paths...>
 #                                       gate, then git add + commit - one call
 #
@@ -25,7 +26,7 @@
 # Exit code is truthful: 0 = clean, 1 = findings, 2 = missing binary.
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('check', 'build', 'smoke', 'run', 'core', 'kill', 'all', 'publish')]
+    [ValidateSet('check', 'build', 'smoke', 'run', 'core', 'kill', 'all', 'clean', 'publish')]
     [string]$cmd,
 
     # `check`/`build`/`smoke` lock target\debug\*.exe, so stray processes are
@@ -152,6 +153,28 @@ switch ($cmd) {
     'all' {
         if (-not $keep) { Stop-Vanguard }
         $ok = Invoke-Gate
+    }
+    'clean' {
+        Stop-Vanguard
+        $out = Join-Path $tmp 'dev_out.txt'
+        $err = Join-Path $tmp 'dev_err.txt'
+        Write-Host '--- cargo clean ---'
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        & cargo clean > $out 2> $err
+        $ErrorActionPreference = $prevEap
+        if ($LASTEXITCODE -ne 0) {
+            Get-Content $out, $err -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+        }
+        Write-Host ('OK    cargo clean  (exit ' + $LASTEXITCODE + ')')
+        # AI-generated leftovers in the repo root. .gitignore keeps them out of
+        # git, but nothing ever deletes them, so they pile up on disk.
+        $stale = @(Get-ChildItem -Path $repo -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like 'vanguard_app_*' -or $_.Name -like 'vanguard_tmp_*' -or $_.Name -like 'vanguard_script_*' })
+        $freed = 0
+        foreach ($f in $stale) { $freed += $f.Length; Remove-Item -LiteralPath $f.FullName -Force }
+        Write-Host ('OK    removed ' + $stale.Count + ' stale generated files (' + [math]::Round($freed / 1MB, 2) + ' MB)')
+        $ok = $true
     }
     'publish' {
         if (-not $m) {

@@ -60,6 +60,7 @@ pub fn script_id_from_path(path: &str) -> Option<String> {
     if name.len() > 16 { Some(name[13..name.len() - 3].to_string()) } else { None }
 }
 
+#[derive(Default)]
 pub struct VanguardAI {
     /// Диалог, который уходит в каждый запрос: пары (role, content).
     /// Раньше этого поля не было вовсе — запрос состоял из [system, user], и модель
@@ -69,7 +70,7 @@ pub struct VanguardAI {
 
 impl VanguardAI {
     pub fn new() -> Self {
-        Self { messages: Vec::new() }
+        Self::default()
     }
     pub fn clear_memory(&mut self) {
         // Сбрасываем диалог — на это завязаны /reset и Ctrl+L в app.rs
@@ -134,13 +135,21 @@ pub struct VanguardShell {
     pub bg_tasks: Arc<AtomicUsize>,
 }
 
-impl VanguardShell {
-    pub fn new() -> Self {
+impl Default for VanguardShell {
+    fn default() -> Self {
         Self {
             ai_core: VanguardAI::new(),
             log_tx: None,
+            // В точности прежний счётчик: Arc<AtomicUsize>::default() — это
+            // Arc::new(AtomicUsize::new(0)).
             bg_tasks: Arc::new(AtomicUsize::new(0)),
         }
+    }
+}
+
+impl VanguardShell {
+    pub fn new() -> Self {
+        Self::default()
     }
     pub fn handle_command(&mut self, query: &str) -> ShellAction {
         let trimmed = query.trim();

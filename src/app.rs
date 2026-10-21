@@ -76,7 +76,7 @@ fn recent_scripts_scan() -> Vec<(String, String)> {
             items.push((mtime, id, name));
         }
     }
-    items.sort_by(|a, b| b.0.cmp(&a.0));
+    items.sort_by_key(|a| std::cmp::Reverse(a.0));
     items.into_iter().take(6).map(|(_, id, name)| (id, name)).collect()
 }
 
@@ -247,15 +247,17 @@ impl VanguardOSApp {
 
         // Windows-шрифты: Segoe UI (интерфейс) и Consolas (терминал). Если файлов
         // нет (не Windows) — остаются шрифты egui, приложение не падает.
+        // NB: `FontData::from_owned` уже возвращает FontData — раньше здесь стоял
+        // лишний `.into()`, который clippy помечал как useless_conversion.
         let mut fonts = egui::FontDefinitions::default();
         if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
-            fonts.font_data.insert("segoe".to_string(), egui::FontData::from_owned(bytes).into());
+            fonts.font_data.insert("segoe".to_string(), egui::FontData::from_owned(bytes));
             fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(0, "segoe".to_string());
         }
         // Segoe UI Symbol: ✎ ❯ ⚙ ▦ и прочие знаки интерфейса, которых нет в
         // самом Segoe UI. Стоит сразу после него в цепочке подстановки.
         if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\seguisym.ttf") {
-            fonts.font_data.insert("seguisym".to_string(), egui::FontData::from_owned(bytes).into());
+            fonts.font_data.insert("seguisym".to_string(), egui::FontData::from_owned(bytes));
             fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().insert(1, "seguisym".to_string());
         }
         let mono_path = ["C:\\Windows\\Fonts\\consola.ttf", "C:\\Windows\\Fonts\\CascadiaMono.ttf"]
@@ -263,7 +265,7 @@ impl VanguardOSApp {
             .find(|p| std::fs::metadata(p).is_ok());
         if let Some(path) = mono_path {
             if let Ok(bytes) = std::fs::read(path) {
-                fonts.font_data.insert("winmono".to_string(), egui::FontData::from_owned(bytes).into());
+                fonts.font_data.insert("winmono".to_string(), egui::FontData::from_owned(bytes));
                 fonts.families.get_mut(&egui::FontFamily::Monospace).unwrap().insert(0, "winmono".to_string());
             }
         }
@@ -580,7 +582,9 @@ impl VanguardOSApp {
     /// делал шелл) и держит `bg_tasks`, пока лог не дотечёт токеном в чат.
     /// Возвращает false для всего, что не `/run <id>` — такое ведёт себя локально.
     fn try_core_run(&mut self, cmd: &str) -> bool {
-        let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
+        // split_whitespace сам пропускает пустые символы по краям — trim() был лишним
+        // (clippy: redundant_trim_before_splits).
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
         if parts.len() < 2 || !parts[0].eq_ignore_ascii_case("/run") {
             return false;
         }
@@ -1539,8 +1543,9 @@ impl eframe::App for VanguardOSApp {
                     recent_scripts: &self.recent_scripts,
                 };
                 let intents = self.desktop.draw(ui, ctx, &mut host);
-                // host держит заимствования полей self — отпускаем их до &mut self ниже.
-                drop(host);
+                // host держит заимствования полей self, но его последнее использование —
+                // строка выше: NLL заканчивает их там же, поэтому явный drop() был
+                // бессмыслен (clippy: drop_non_drop — у DesktopHost нет Drop).
                 for intent in intents {
                     self.apply_desktop_intent(intent, ctx);
                 }

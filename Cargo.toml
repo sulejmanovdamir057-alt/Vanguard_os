@@ -55,3 +55,16 @@ path = "src/main.rs"
 [[bin]]
 name = "vanguard_core"
 path = "src/bin/core.rs"
+
+# ── Профили сборки ──
+# dev остаётся дефолтным: RustRover дебажит, а debug-информация на диске —
+# осознанно платимая цена (target/ разрастается до 5+ ГБ; чистит `vg clean`).
+#
+# release собирается под раздачу. LTO + один codegen-unit + strip дают заметно
+# меньший и быстрый exe ценой примерно двукратной сборки (~46 c -> ~90 c).
+# panic = "abort" намеренно НЕ ставится: оболочка — GUI, а abort вместо
+# unwinding убивает окно без шанса на что-либо.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"

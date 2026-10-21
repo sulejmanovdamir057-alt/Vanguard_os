@@ -13,6 +13,15 @@ pub struct SystemMetrics {
 
 impl SystemMetrics {
     pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+// clippy требует `Default` к любому `new()` без аргументов. Здесь дефолт — это не
+// «пустая структура», а состояние «данные ещё не собраны», поэтому impl пишется
+// руками: у derive получились бы пустые строки вместо подписей.
+impl Default for SystemMetrics {
+    fn default() -> Self {
         Self {
             current_cpu_load: 0.0,
             current_ram_percent: 0.0,
