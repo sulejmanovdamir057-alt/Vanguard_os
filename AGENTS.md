@@ -13,7 +13,9 @@ the GUI:
   and an IPC *client*. Entry `src/main.rs`.
 - `vanguard_core` — the **core**: TCP server on `127.0.0.1:7331` doing the heavy/system work
   (slash-commands, `/run`, `rustc -O` compilation, telemetry). Entry `src/bin/core.rs`. The
-  shell **autostarts it on demand** (see `ipc_client.rs`), so `cargo run` alone is enough.
+  shell **autostarts it on demand** (see `ipc_client.rs`), so `cargo run` alone is enough —
+  and it does that by re-launching **its own exe** with `--core`, no longer by finding
+  `vanguard_core.exe` beside it. That is what makes the distribution one file (`vg dist`).
 - `vanguard_os_lib` (`src/lib.rs`) — shared code: the IPC protocol, `ai_core`, and the engine
   moved to `src/core/{shell,executor,telemetry}.rs`. Both binaries are thin wrappers over it,
   which is what keeps the protocol from drifting apart.
@@ -21,6 +23,15 @@ the GUI:
 The split exists for one measured reason: `rustc -O` compilation used to run on the UI thread
 and froze the render for seconds. Everything else stayed in the shell because it is not heavy
 (AI streaming is SSE on a background thread already).
+
+**How one binary serves both roles.** `src/main.rs` pulls the core entry in as
+`#[path = "bin/core.rs"] mod core_server;` and runs `core_server::main()` when `--core` is on the
+command line. The `fn main` in `bin/core.rs` is therefore `pub(crate)`, not private — a parent
+module cannot see a private child item (E0603, hit on the first attempt) and not `pub` either,
+since nothing outside the crate should call it. The two-process runtime split above is untouched;
+only the *file layout* changed, and `vanguard_core.exe` still exists for `vg core` and for
+`fs_smoke.ps1`. Cost: the shared file now compiles into both binaries — the shell went 8.77 →
+8.95 MB (dynamic) purely from carrying the core's body.
 
 ## Commands
 
@@ -54,7 +65,7 @@ and froze the render for seconds. Everything else stayed in the shell because it
     why `psinit.ps1` builds the repo path at runtime with
     `Join-Path ([Environment]::GetFolderPath('UserProfile')) ...` instead of writing the user
     name out, and why `fs_smoke.ps1` never quotes Russian error strings.
-- `powershell -File tools\dev.ps1 <check|build|smoke|run|core|kill|all|clean|publish>` — **use this
+- `powershell -File tools\dev.ps1 <check|build|smoke|run|core|kill|all|clean|dist|publish>` — **use this
   instead of calling cargo by hand.** One call kills the stray `vanguard_os`/`vanguard_core` (they lock
   `target\debug\*.exe`), runs cargo with stdout/stderr redirected to files, prints every
   `error`/`warning:` line plus the elapsed time, and exits **truthfully** (0 = clean, 1 = findings).
@@ -66,14 +77,26 @@ and froze the render for seconds. Everything else stayed in the shell because it
     switch, so no subcommand has to be remembered): each invocation drops stale
     `vanguard_tmp_*`/`vanguard_app_*`/`vanguard_script_*` (7 days), `src\`+`tools\*.rs.bak`
     (7 days) and `%TEMP%\opencode\*.txt` scratch logs (1 day); `target\` cargo-cleans itself once
-    it passes **4 GB** — at most once per 24 h, only on `build|smoke|run|core|all|publish`, and
-    **never during `check`**, whose 0.42 s must not pay the ~370 ms size walk (measured over
-    ~5k files). A fired tier 2 costs the *next* build a full rebuild (~60 s) — that is the price
-    of never running `vg clean` by hand. Overrides: `VANGUARD_GC_HOURS`, `VANGUARD_GC_LIMIT_GB`.
+    it passes **4 GB** — at most once per 24 h, only for the commands that rebuild anyway
+    (`dist` calls `Invoke-GcTarget` explicitly), and **never during `check`**, whose 0.42 s must
+    not pay the ~370 ms size walk (measured over ~5k files). A fired tier 2 costs the *next* build
+    a full rebuild (~60 s) — that is the price of never running `vg clean` by hand. Overrides:
+    `VANGUARD_GC_HOURS`, `VANGUARD_GC_LIMIT_GB`.
     The globs deliberately exclude `vanguard_gen_*.py` (the `/apps` registry) and
     `vanguard_notes.txt`/`vanguard_settings.json`/`vanguard_dialogues.jsonl` (user data) — a
     loose `vanguard_*` would eat all of them. Tier 2 also skips while either binary is running
     (`target\*.exe` locked). `clean` just forces both tiers: no age, no threshold, no throttle.
+  - **`dist` = the one-file distribution**, `dist\vanguard_os.zip` (4.02 MB, verified): release
+    build with `RUSTFLAGS=-C target-feature=+crt-static`, stage `vanguard_os.exe` + `README.txt`
+    (Russian, copied from `tools/dist_readme.txt` — it lives outside the `.ps1` because that file
+    must stay ASCII), start the **staged** exe as `--core`, ping `127.0.0.1:7331` until
+    `{"kind":"pong"}`, stop it, zip. Measured: the dynamic build imports `vcruntime140.dll` (needs
+    the VC++ Redistributable), the static one has system DLLs only, 8.95 → 9.09 MB; the zip is
+    4.02 MB. Two traps it encodes: the verdict is read **before** `Stop-Process` (killing first
+    flips `HasExited` and makes every success read as a crash — that is how the first run failed
+    with the exe working all along), and the flag is set per-invocation, so nothing else flips
+    the release cache — but a hand-run `cargo build --release` *without* it pays one full ~90 s
+    rebuild back.
   - It encodes the Windows trap below so you do not have to re-derive it: cargo writes
     `Finished ...` to **stderr**, so `2>` under `$ErrorActionPreference='Stop'` raises
     `NativeCommandError` on a *successful* build. `Invoke-Cargo` relaxes the preference for that

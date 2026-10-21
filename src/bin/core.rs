@@ -29,7 +29,9 @@ use vanguard_os_lib::core::shell::VanguardShell;
 use vanguard_os_lib::core::telemetry::{spawn_telemetry_daemon, SystemMetrics};
 use vanguard_os_lib::ipc::{self, Event, FsEntry, FsFile, FsListing, Request, Response};
 
-fn main() {
+/// `pub(crate)` — не для наружу: так эту же функцию зовёт `src/main.rs`,
+/// подключивший файл модулем `#[path]` ради раздачи одним бинарником.
+pub(crate) fn main() {
     let addr = ipc::core_addr();
     let listener = match TcpListener::bind(&addr) {
         Ok(l) => l,

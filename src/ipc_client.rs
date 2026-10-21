@@ -1,13 +1,13 @@
-//! IPC-клиент оболочки: связь с ядром `vanguard_core.exe` по TCP.
+//! IPC-клиент оболочки: связь с ядром по TCP.
 //!
 //! Ядро — отдельный процесс. Оболочка подключается к `127.0.0.1:7331`; если его
-//! ещё нет, запускает `vanguard_core.exe` сама (из той же папки, где лежит эта
-//! оболочка) и ждёт, пока поднимется listener. Каждый вызов держит соединение
-//! на время одного запроса — проще, чем пул, а задержка локалхоста несущественна.
+//! ещё нет, запускает его сама — **собственную копию с флагом `--core`** (см.
+//! `spawn_core_process`), так что отдельный `vanguard_core.exe` рядом не нужен.
+//! Каждый вызов держит соединение на время одного запроса — проще, чем пул,
+//! а задержка локалхоста несущественна.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -128,15 +128,19 @@ fn connect_with_autostart() -> std::io::Result<TcpStream> {
     ))
 }
 
-/// Ищем `vanguard_core.exe` рядом с текущим бинарником и запускаем его фоном.
+/// Поднимаем ядро. Раздаётся один файл, поэтому ядро — это **сама оболочка**,
+/// перезапущенная с флагом `--core`: отдельный `vanguard_core.exe` рядом больше
+/// не нужен. Он по-прежнему собирается, но только для ручного запуска (`vg core`)
+/// и для `fs_smoke.ps1`.
 fn spawn_core_process() {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let core_path = exe_dir.join("vanguard_core.exe");
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        // Без пути не запустить — вернётся ошибка при connect.
+        Err(_) => return,
+    };
 
-    let mut cmd = Command::new(&core_path);
+    let mut cmd = Command::new(exe);
+    cmd.arg("--core");
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     // create_no_window: ядро — служебный процесс, отдельного окна/консоли не нужно.
     #[cfg(windows)]

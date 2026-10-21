@@ -14,7 +14,8 @@
 #   pwsh -File tools\dev.ps1 core       build + start the core alone (no GUI)
 #   pwsh -File tools\dev.ps1 kill       kill stray vanguard_os / vanguard_core
 #   pwsh -File tools\dev.ps1 all        check + build + smoke
-#   pwsh -File tools\dev.ps1 clean       force both cleanup tiers right now
+#   pwsh -File tools\dev.ps1 clean      force both cleanup tiers right now
+#   pwsh -File tools\dev.ps1 dist       release build -> dist\vanguard_os.zip
 #   pwsh -File tools\dev.ps1 publish -m <msg> -- <paths...>
 #                                       gate, then git add + commit - one call
 #
@@ -26,12 +27,13 @@
 # `check` is the iteration loop (422 ms with nothing to do, 1.9 s after a source
 # edit - measured). `all` is the pre-commit gate. `publish` collapses the whole
 # "verify, stage, commit" sequence into one shell call; the gate runs first so
-# nothing unbuildable gets committed.
+# nothing unbuildable gets committed. `dist` makes the ONE-FILE release: static
+# CRT (no VC++ redist), staged exe + README, `--core` verified, then zipped.
 #
 # Exit code is truthful: 0 = clean, 1 = findings, 2 = missing binary.
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('check', 'build', 'smoke', 'run', 'core', 'kill', 'all', 'clean', 'publish')]
+    [ValidateSet('check', 'build', 'smoke', 'run', 'core', 'kill', 'all', 'clean', 'dist', 'publish')]
     [string]$cmd,
 
     # `check`/`build`/`smoke` lock target\debug\*.exe, so stray processes are
@@ -278,6 +280,84 @@ switch ($cmd) {
         Invoke-GcTarget -force
         Invoke-GcArtifacts -force
         $ok = $true
+    }
+    'dist' {
+        if (-not $keep) { Stop-Vanguard }
+        # Tier 2 (which runs ahead of the switch for the other build commands
+        # only) is called here explicitly: a GC firing inside dist would wipe
+        # target\ right before the one build where a full rebuild hurts most.
+        Invoke-GcTarget
+        # Static CRT, release-only. The deliverable has to run on a machine with
+        # no VC++ Redistributable: a dynamic build imports vcruntime140.dll
+        # (measured), while api-ms-win-crt-* is inbox on Windows 10+. Nothing
+        # else in this script builds release, so this flag never thrashes the
+        # release cache back and forth.
+        $env:RUSTFLAGS = '-C target-feature=+crt-static'
+        $ok = Invoke-Cargo @('build', '--release')
+        Remove-Item env:RUSTFLAGS -ErrorAction SilentlyContinue
+
+        $dist = Join-Path $repo 'dist'
+        $zip = Join-Path $dist 'vanguard_os.zip'
+        if ($ok) {
+            if (Test-Path -LiteralPath $dist) { Remove-Item -LiteralPath $dist -Recurse -Force }
+            New-Item -ItemType Directory -Path $dist | Out-Null
+            Copy-Item (Join-Path $repo 'target\release\vanguard_os.exe') -Destination $dist
+            Copy-Item (Join-Path $PSScriptRoot 'dist_readme.txt') -Destination (Join-Path $dist 'README.txt')
+            Write-Host 'OK    staged dist\vanguard_os.exe + README.txt'
+        }
+
+        # The entire point of one file: `--core` must actually serve. Ping the
+        # STAGED exe (not target\) on 127.0.0.1:7331, then stop exactly the PID
+        # we started - never Stop-Vanguard here, that would take a GUI the user
+        # may have open with -keep.
+        if ($ok) {
+            $exe = Join-Path $dist 'vanguard_os.exe'
+            $p = Start-Process -FilePath $exe -ArgumentList '--core' `
+                -WorkingDirectory $dist -PassThru -WindowStyle Hidden
+            $pong = $false
+            for ($i = 0; $i -lt 30 -and -not $pong; $i++) {
+                Start-Sleep -Milliseconds 100
+                try {
+                    $c = New-Object Net.Sockets.TcpClient
+                    $c.Connect('127.0.0.1', 7331)
+                    $st = $c.GetStream()
+                    $st.ReadTimeout = 1500
+                    $b = [Text.Encoding]::UTF8.GetBytes('{"cmd":"ping"}' + "`n")
+                    $st.Write($b, 0, $b.Length)
+                    $r = New-Object byte[] 4096
+                    $n = $st.Read($r, 0, $r.Length)
+                    $c.Close()
+                    $txt = [Text.Encoding]::UTF8.GetString($r, 0, $n).Trim()
+                    if ($txt) {
+                        # Same shape fs_smoke.ps1 asserts on: Response::Pong is
+                        # serde-tagged, so the line is {"kind":"pong"}.
+                        $o = $txt | ConvertFrom-Json
+                        if ($o.kind -eq 'pong') { $pong = $true }
+                    }
+                } catch { }
+            }
+            # Verdict BEFORE the stop: killing first flips HasExited, so every
+            # successful run would read as a crash - that is exactly how the
+            # first dist run "failed" while the exe served pings fine.
+            $alive = ($p -and -not $p.HasExited)
+            if (-not $alive) {
+                Write-Host 'FAIL  staged exe exited on --core (port 7331 already taken?)'
+                $ok = $false
+            } elseif (-not $pong) {
+                Write-Host 'FAIL  staged exe did not answer ping on 127.0.0.1:7331'
+                $ok = $false
+            } else {
+                Write-Host 'OK    staged exe serves as core (--core answered pong)'
+            }
+            if ($alive) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+        }
+
+        if ($ok) {
+            Compress-Archive -Path (Join-Path $dist 'vanguard_os.exe'), (Join-Path $dist 'README.txt') `
+                -DestinationPath $zip -Force
+            Write-Host ('OK    dist\vanguard_os.zip  ' + [math]::Round((Get-Item $zip).Length / 1MB, 2) + ' MB')
+        }
+        if (-not $ok) { Write-Host 'FAIL  dist' }
     }
     'publish' {
         if (-not $m) {
