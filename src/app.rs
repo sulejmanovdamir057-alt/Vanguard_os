@@ -102,6 +102,105 @@ pub(crate) fn endpoint_host_port(url: &str) -> (String, u16) {
     (authority.to_string(), 80)
 }
 
+/// Открыть ссылку или файл штатным обработчиком системы — как двойной клик
+/// в Проводнике. На Windows `explorer.exe` принимает и путь, и URL и делает
+/// это через ShellExecute; сам `cmd /c start` намеренно не берётся, потому
+/// что cmd перечитывает свою командную строку и `&` из query URL ушёл бы
+/// на разбор как разделитель команд.
+pub(crate) fn sys_open(target: &str) -> Result<(), String> {
+    // Кавычки вычищаем: закрытая ими часть пошла бы на разбор cmd-а,
+    // а в путях Windows они и вовсе запрещены.
+    let clean = target.replace('"', "");
+    #[cfg(windows)]
+    let mut cmd = std::process::Command::new("explorer.exe");
+    #[cfg(not(windows))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(&clean);
+    match cmd.spawn() {
+        // Без ожидания: обработчик — чужой процесс, ждать его закрытия нельзя,
+        // это заморозило бы кадр рендера.
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("не удалось запустить обработчик: {}", e)),
+    }
+}
+
+/// Ссылки из ленты чата: до пяти штук, в порядке появления, без дублей.
+/// Байтовый проход вместо regex — зовётся каждый кадр, а компилировать
+/// выражение ради одного `find("http")` нечем оправдать.
+fn chat_links(text: &str) -> Vec<String> {
+    const MAX: usize = 5;
+    const STOP: &[u8] = b"\"'<>`()";
+    let bytes = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while out.len() < MAX && i + 4 <= bytes.len() {
+        if !bytes[i..i + 4].eq_ignore_ascii_case(b"http") {
+            i += 1;
+            continue;
+        }
+        // Схема обязательна: «http» внутри слова (httpd) ссылкой не является.
+        let head = if bytes[i + 4..].starts_with(b"://") {
+            7 // http://
+        } else if i + 8 <= bytes.len() && bytes[i + 4..i + 8].eq_ignore_ascii_case(b"s://") {
+            8 // https://
+        } else {
+            i += 4;
+            continue;
+        };
+        let start = i;
+        let mut j = i + head;
+        // Конец ссылки — пробел либо кавычка/скобка; хвостовую пунктуацию
+        // (запятая, точка в конце предложения) срезаем.
+        while j < bytes.len() && !bytes[j].is_ascii_whitespace() && !STOP.contains(&bytes[j]) {
+            j += 1;
+        }
+        let url = text[start..j].trim_end_matches(|c: char| ".,;:!?]}".contains(c));
+        if url.len() > head && !out.iter().any(|u| u == url) {
+            out.push(url.to_string());
+        }
+        i = j;
+    }
+    out
+}
+
+/// Полоса ссылок под лентой чата: внутри `TextEdit` ссылки некликабельны,
+/// поэтому место им — кнопками сразу под ним. `err` живёт отдельно от чата:
+/// писать в него строки из окна во время стрима перетёр бы маркер превью.
+fn draw_chat_links(ui: &mut egui::Ui, text: &str, err: &mut String) {
+    let links = chat_links(text);
+    if links.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.label(egui::RichText::new("ссылки:").size(10.0).weak());
+        for url in &links {
+            if ui
+                .small_button(egui::RichText::new(url.as_str()).size(11.0))
+                .clicked()
+            {
+                match sys_open(url) {
+                    Ok(()) => err.clear(),
+                    Err(e) => *err = format!("{} — {}", url, e),
+                }
+            }
+        }
+        if !err.is_empty() {
+            ui.label(
+                egui::RichText::new(err.as_str())
+                    .size(10.0)
+                    .color(egui::Color32::from_rgb(255, 96, 96)),
+            );
+        }
+    });
+}
+
+/// Всплывающее уведомление в правом нижнем углу: для событий, о которых
+/// человек мог не знать — ответ ИИ пришёл, пока он сидел в другом окне.
+struct Toast {
+    text: String,
+    born: std::time::Instant,
+}
+
 /// Опорные размеры окна и центр заставки — те же числа, что уходят в
 /// `ViewportBuilder::with_inner_size` (см. `main.rs`). Стол больше не привязан
 /// к ним: он берёт реальный вьюпорт каждый кадр, а отсюда считаются пропорции
@@ -142,6 +241,24 @@ pub struct VanguardOSApp {
     /// Строка ввода команд и буфер вывода чата (рисует desktop.rs).
     user_input: String,
     ai_text_area: String,
+    /// Панель ИИ справа (Copilot-стиль, Ctrl+Space). Своё состояние, а не окно:
+    /// хрома у неё нет и живёт она поверх всего, как меню «Пуск».
+    ai_panel_open: bool,
+    /// Строка ввода панели — отдельна от `user_input`, чтобы запрос из панели
+    /// не перехватывался строкой терминала.
+    ai_panel_input: String,
+    /// Панель только что открылась — просим фокус в её поле (тот же приём,
+    /// что `focus_input_pending` у терминала).
+    ai_panel_focus_pending: bool,
+    /// Прикреплять ли к запросу контекст (путь «Файлов» / заметки).
+    ai_panel_ctx: bool,
+    /// Последняя ошибка запуска системного обработчика (ссылка/файл не
+    /// открылись). Живёт отдельно от чата: писать туда во время стрима
+    /// перетёр бы маркер превью.
+    open_err: String,
+    /// Очередь всплывающих уведомлений — рисуются в конце `update()` и гаснут
+    /// сами (см. `draw_toasts`).
+    toasts: Vec<Toast>,
     /// Фоновая телеметрия и история загрузки CPU для графика.
     metrics_link: Arc<Mutex<SystemMetrics>>,
     cpu_history: VecDeque<f32>,
@@ -297,6 +414,13 @@ impl VanguardOSApp {
             ],
             log_lines: Vec::new(), current_log_index: 0, user_input: String::new(),
             ai_text_area: String::from("VANGUARD CORE: Awaiting input command...\n"),
+            // Панель ИИ (Ctrl+Space): по умолчанию закрыта, с прикреплением контекста.
+            ai_panel_open: false,
+            ai_panel_input: String::new(),
+            ai_panel_focus_pending: false,
+            ai_panel_ctx: true,
+            open_err: String::new(),
+            toasts: Vec::new(),
             metrics_link: metrics, cpu_history: cpu_hist, shell,
             windows: VanguardWindows::new(),
             explorer_sel: None,
@@ -561,6 +685,9 @@ impl VanguardOSApp {
                     self.windows.get_mut(wid).minimized = true;
                 }
             }
+            // Панель ИИ — своё состояние приложения, поэтому стол лишь просит
+            // её открыть; сам запрос панель собирает и шлёт сама.
+            DesktopIntent::AskAi => self.open_ai_panel(String::new()),
         }
     }
 
@@ -655,6 +782,7 @@ impl VanguardOSApp {
                             .lock_focus(true),
                     );
                 });
+            draw_chat_links(ui, &self.ai_text_area, &mut self.open_err);
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let input_field = ui.add(
@@ -700,6 +828,261 @@ impl VanguardOSApp {
             // send_ai_query сам чистит поле, эхо-строку пишет в чат и решает,
             // слеш-команда это или запрос к модели.
             self.send_ai_query();
+        }
+    }
+
+    /// Поставить уведомление в очередь. Живут они шесть секунд и гаснут сами;
+    /// больше трёх не держим — четвёртое вытеснило бы первое, которое человек
+    /// ещё не успел прочитать.
+    fn toast(&mut self, text: impl Into<String>) {
+        if self.toasts.len() >= 3 {
+            self.toasts.remove(0);
+        }
+        self.toasts.push(Toast {
+            text: text.into(),
+            born: std::time::Instant::now(),
+        });
+    }
+
+    /// Уведомления в правом нижнем углу, над панелью задач. Сам рендер ничего
+    /// не меняет, поэтому за перерисовку ради гашения отвечает
+    /// `request_repaint_after` — иначе тост висел бы вечно до мышки.
+    fn draw_toasts(&mut self, ctx: &egui::Context) {
+        const LIFE: f64 = 6.0;
+        self.toasts.retain(|t| t.born.elapsed().as_secs_f64() < LIFE);
+        if self.toasts.is_empty() {
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(400));
+        egui::Area::new(egui::Id::new("toasts"))
+            .anchor(
+                egui::Align2::RIGHT_BOTTOM,
+                egui::vec2(-12.0, -(crate::ui_window::TASKBAR_H + 12.0)),
+            )
+            .order(egui::Order::Foreground)
+            .movable(false)
+            .show(ctx, |ui| {
+                for t in &self.toasts {
+                    // Последняя секунда — растворение, а не исчезновение рывком.
+                    let fade = (t.born.elapsed().as_secs_f64() - (LIFE - 1.0))
+                        .max(0.0)
+                        .clamp(0.0, 1.0);
+                    let a = 1.0 - fade;
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgba_unmultiplied(24, 28, 38, (230.0 * a) as u8))
+                        .inner_margin(egui::Margin::same(10.0))
+                        .show(ui, |ui| {
+                            ui.set_max_width(300.0);
+                            ui.label(
+                                egui::RichText::new(t.text.as_str())
+                                    .size(12.0)
+                                    .color(egui::Color32::from_rgba_unmultiplied(
+                                        235, 238, 245, (255.0 * a) as u8,
+                                    )),
+                            );
+                        });
+                }
+            });
+    }
+
+    /// ✦ Панель ИИ справа (Copilot-стиль): та же лента чата и та же история,
+    /// что у терминала, но доступна из любого окна — по Ctrl+Space, пункту ПКМ
+    /// на столе или кнопке в проводнике. Отдельным окном она не стала
+    /// намеренно: нет хрома, не сворачивается и живёт поверх всего — как «Пуск».
+    fn draw_ai_panel(&mut self, ctx: &egui::Context) {
+        // Своя горячка и своё Esc — тем же порядком, как у «Пуска» и календаря:
+        // панель проверяет их сама, чтобы не сдвигать порядок ввода окон.
+        if ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Space)) {
+            self.ai_panel_open = !self.ai_panel_open;
+            self.ai_panel_focus_pending = self.ai_panel_open;
+        }
+        if !self.ai_panel_open {
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && !ctx.wants_keyboard_input() {
+            self.ai_panel_open = false;
+            return;
+        }
+
+        let panel_w = 380.0_f32.min(self.win_w * 0.34);
+        let area_h = self.win_h - crate::ui_window::TASKBAR_H;
+        // Подпись контекста считаем заранее: панель внутри работает с полями
+        // через &mut, а метод требует целого &self — замыкание захватило бы
+        // структуру целиком и столкнулось бы с этими полями.
+        let ctx_label = self.ai_context_label();
+        let mut submit = false;
+
+        egui::Area::new(egui::Id::new("ai_panel"))
+            .fixed_pos(egui::pos2(self.win_w - panel_w, 0.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(20, 23, 30))
+                    .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(58, 64, 78)))
+                    // Явный Margin, а не голый `10.0`: у `impl Into<Margin>`
+                    // числовой литерал без типа выводится в f64 и проваливается.
+                    .inner_margin(egui::Margin::same(10.0))
+                    .show(ui, |ui| {
+                        ui.set_width(panel_w - 20.0);
+                        ui.set_min_height(area_h - 20.0);
+
+                        // ── Шапка: заголовок, признак стрима, закрытие ──
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("ИИ-ассистент").size(13.0).strong());
+                            if self.is_ai_streaming {
+                                ui.label(
+                                    egui::RichText::new("● думаю…")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(255, 130, 100)),
+                                );
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("✕").clicked() {
+                                    self.ai_panel_open = false;
+                                }
+                            });
+                        });
+
+                        // ── Контекст: что прикрепится к запросу. Клик переключает ──
+                        ui.horizontal(|ui| {
+                            if ctx_label.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("без контекста — спросите про файл или текст")
+                                        .size(11.0)
+                                        .weak(),
+                                );
+                            } else {
+                                let mark = if self.ai_panel_ctx { "◉" } else { "○" };
+                                let resp = ui
+                                    .button(format!("{}  {}", mark, ctx_label))
+                                    .on_hover_text(if self.ai_panel_ctx {
+                                        "Контекст прикреплён к запросу. Клик — отключить."
+                                    } else {
+                                        "Клик — прикрепить контекст к запросу."
+                                    });
+                                if resp.clicked() {
+                                    self.ai_panel_ctx = !self.ai_panel_ctx;
+                                }
+                            }
+                        });
+                        ui.separator();
+
+                        // ── Лента чата: тот же буфер, что у терминала ──
+                        egui::ScrollArea::vertical()
+                            .id_source("ai_panel_scroll")
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.ai_text_area)
+                                        .font(egui::FontId::monospace(11.0))
+                                        .text_color(egui::Color32::WHITE)
+                                        .desired_width(f32::INFINITY)
+                                        .lock_focus(true)
+                                        // Только читать и выделять: править ленту из
+                                        // панели незачем, терминал для этого остаётся.
+                                        .interactive(false),
+                                );
+                            });
+                        draw_chat_links(ui, &self.ai_text_area, &mut self.open_err);
+
+                        ui.add_space(6.0);
+
+                        // ── Строка запроса ──
+                        ui.horizontal(|ui| {
+                            let field = ui.add(
+                                egui::TextEdit::singleline(&mut self.ai_panel_input)
+                                    .id(egui::Id::new("ai_panel_input"))
+                                    .desired_width(ui.available_width() - 54.0)
+                                    .hint_text("Спросить ИИ…"),
+                            );
+                            // Панель только что открылась/отправилась — фокус в поле.
+                            if self.ai_panel_focus_pending {
+                                field.request_focus();
+                                self.ai_panel_focus_pending = false;
+                            }
+                            // Enter в singleline фокус не теряет сам, поэтому
+                            // ловим его напрямую — как кнопка EXEC у терминала.
+                            if field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                                submit = true;
+                            }
+                            if ui.button("❯").clicked() {
+                                submit = true;
+                            }
+                        });
+                    });
+            });
+
+        if submit {
+            let raw = self.ai_panel_input.trim().to_string();
+            self.ai_panel_input.clear();
+            if raw.is_empty() {
+                return;
+            }
+            // Слеш-команды (/help, /run) уходят как есть: контекстная строка
+            // перед ними сломала бы распознавание в шелле (starts_with('/')).
+            let full = if self.ai_panel_ctx && !raw.starts_with('/') {
+                let ctx_line = self.ai_context_line();
+                if ctx_line.is_empty() {
+                    raw.clone()
+                } else {
+                    format!("{}\n\n{}", ctx_line, raw)
+                }
+            } else {
+                raw.clone()
+            };
+            // В историю ↑/↓ — только то, что ввёл человек: служебная строка
+            // контекста в истории не нужна, в запросе она есть.
+            self.push_history(&raw);
+            self.send_ai_query_text(full);
+            // Отправили, но остаёмся в панели: спрашивают обычно цепочками.
+            self.ai_panel_focus_pending = true;
+        }
+    }
+
+    /// Открывает панель ИИ и ставит фокус в её строку. `prefill` — готовый
+    /// вопрос: так панель получает его от кнопки «Спросить ИИ» в проводнике.
+    fn open_ai_panel(&mut self, prefill: String) {
+        self.ai_panel_open = true;
+        self.ai_panel_focus_pending = true;
+        if !prefill.is_empty() {
+            self.ai_panel_input = prefill;
+        }
+    }
+
+    /// Короткая подпись контекста для панели: путь проводника либо блокнот.
+    fn ai_context_label(&self) -> String {
+        let path = self.fs.current_path();
+        if !path.is_empty() {
+            format!("Файлы: {}", path)
+        } else if !self.notes_text.is_empty() {
+            format!("Заметки: {} симв.", self.notes_text.len())
+        } else {
+            String::new()
+        }
+    }
+
+    /// Что прикрепить к запросу. Пишем как сказал бы человек — модель получает
+    /// это внутри своего сообщения, без правок протокола и без отдельного поля.
+    fn ai_context_line(&self) -> String {
+        let path = self.fs.current_path();
+        if !path.is_empty() {
+            format!(
+                "Я работаю в проводнике, открыт путь: {}. Мой вопрос про него.",
+                path
+            )
+        } else if !self.notes_text.is_empty() {
+            // Заметку целиком не тащим: длинный текст на каждом ходу съедает
+            // префилл истории (24 сообщения капа) и замедляет ответ.
+            let head: String = self.notes_text.chars().take(1200).collect();
+            let more = if self.notes_text.chars().count() > 1200 { "…" } else { "" };
+            format!(
+                "Открыт блокнот ({} симв.), начало:\n{}{}",
+                self.notes_text.len(),
+                head,
+                more
+            )
+        } else {
+            String::new()
         }
     }
 
@@ -1234,12 +1617,18 @@ impl VanguardOSApp {
 
     pub fn send_ai_query(&mut self) {
         let query = self.user_input.trim().to_string();
+        self.user_input.clear();
+        self.send_ai_query_text(query);
+    }
+
+    /// Отправляет готовый запрос: дублирует его эхо в чат, решает, слеш-команда
+    /// это или модель, и будит стрим. Общий путь для строки терминала и панели
+    /// ИИ — отличается у них только способ достать текст.
+    pub fn send_ai_query_text(&mut self, query: String) {
         if query.is_empty() { return; }
 
         // 1. Дублируем ввод в интерфейс окна
         self.ai_text_area.push_str(&format!("\nvanguard_root@kernel_sh:~# {}\n", query));
-
-        self.user_input.clear();
 
         // `/run` уходит в ядро (фон + лог токеном), остальное — локальный шелл;
         // не-AI ветки (вывод текста, выход) исполняет apply_shell_command —
@@ -1372,13 +1761,19 @@ impl VanguardOSApp {
                 // не идёт — там уже лежит заглушка из ExecuteAction; в чат дописываем,
                 // а если пользователь уже начал новый ответ ИИ — вставляем ПЕРЕД его
                 // превью (по маркеру), иначе следующий Delta перетёр бы результат.
-                AiEvent::ActionOutput(text) => match self.ai_stream_marker {
-                    Some(marker) => {
-                        self.ai_text_area.insert_str(marker, &text);
-                        self.ai_stream_marker = Some(marker + text.len());
+                AiEvent::ActionOutput(text) => {
+                    match self.ai_stream_marker {
+                        Some(marker) => {
+                            self.ai_text_area.insert_str(marker, &text);
+                            self.ai_stream_marker = Some(marker + text.len());
+                        }
+                        None => self.ai_text_area.push_str(&text),
                     }
-                    None => self.ai_text_area.push_str(&text),
-                },
+                    // Компиляция долгая: результат мог прийти, пока человек
+                    // сидел в другом окне, — иначе он увидит его только вернувшись.
+                    let short: String = text.chars().take(70).collect();
+                    self.toast(format!("Ядро: {}", short));
+                }
 
                 // Генерация завершена: маркер снимается, терминал разблокируется,
                 // а если в чате остался python-код — он сохраняется на диск.
@@ -1387,6 +1782,15 @@ impl VanguardOSApp {
                     self.is_ai_streaming = false;
                     if let Some(filename) = self.shell.ai_core.save_code_if_exists(&self.ai_text_area) {
                         self.ai_text_area.push_str(&format!("\n\n[SYSTEM] CODE AUTO-COMPILED: {}", filename));
+                    }
+                    // Ответ готов. Если ленту не видно (терминал свёрнут или
+                    // закрыт, панель не открыта) — сообщаем всплывающим окном,
+                    // иначе человек увидит ответ только вернувшись к чату.
+                    let chat_hidden =
+                        !(self.windows.terminal.is_open && !self.windows.terminal.minimized)
+                            && !self.ai_panel_open;
+                    if chat_hidden {
+                        self.toast("ИИ: ответ готов");
                     }
                     break;
                 }
@@ -1403,6 +1807,9 @@ impl VanguardOSApp {
                     }
                     self.ai_text_area.push_str(&format!("\n\n[CRITICAL AI ERROR]: {}", err_msg));
                     self.is_ai_streaming = false;
+                    // Ошибка всплывает всегда — в другом окне ленту не видно.
+                    let short: String = err_msg.chars().take(70).collect();
+                    self.toast(format!("Ошибка ИИ: {}", short));
                     break;
                 }
             }
@@ -1502,6 +1909,13 @@ impl eframe::App for VanguardOSApp {
         // виджеты, раньше висевшие прямо на обоях.
         self.draw_terminal_window(ctx);
         self.draw_monitor_window(ctx);
+
+        // ✦ Панель ИИ справа: поверх окон и панели задач. Свой порядок ввода
+        // у неё внутри (Ctrl+Space и Esc она ловит сама), окнам ничего не мешает.
+        self.draw_ai_panel(ctx);
+
+        // 🔔 Уведомления — последними, чтобы перекрыть любое окно.
+        self.draw_toasts(ctx);
 
         // 📝 Автосохранение блокнота: пишем только когда текст менялся. На каждый
         // символ — лишняя запись, а полагаться на on_exit нельзя: выход через /exit —

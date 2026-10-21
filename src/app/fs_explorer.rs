@@ -90,12 +90,27 @@ pub(super) struct FsExplorer {
     /// Запрос в полёте. Второй не стартуем — в канале лежит один `Receiver`.
     busy: bool,
     pending: Option<Receiver<FsReply>>,
+    /// Кнопка «Спросить ИИ» попросила панель: готовый вопрос ждёт родителя.
+    /// Как и `pending` — это флаг, а не вызов: своя панель у модуля нет.
+    ask_ai: Option<String>,
     /// Та же счётная дуга, что у шелла: `update()` держит по ней кадр живым,
     /// а панель задач показывает «⚙». Общая именно потому, что счётчик один.
     bg: Arc<AtomicUsize>,
 }
 
 impl FsExplorer {
+    /// Путь текущего каталога **для показа**: пустая строка, если открыт
+    /// виртуальный уровень «Этот компьютер». Родительскому модулю поле `path`
+    /// не отдаём — оно приватное и хранит канонический путь с префиксом `\\?\`,
+    /// а сравнение с такой строкой запрещено (см. `fs_pretty`): только показ.
+    pub(super) fn current_path(&self) -> String {
+        if self.path.is_empty() {
+            String::new()
+        } else {
+            fs_pretty(Path::new(&self.path))
+        }
+    }
+
     /// `bg` берётся у шелла — это его `Arc`, а не копия: один счётчик на
     /// приложение, иначе индикатор фоновых задач врал бы.
     pub(super) fn new(bg: Arc<AtomicUsize>) -> Self {
@@ -114,6 +129,7 @@ impl FsExplorer {
             hist: Vec::new(),
             busy: false,
             pending: None,
+            ask_ai: None,
             bg,
         }
     }
@@ -395,6 +411,37 @@ fn fs_open_file(fs: &mut FsExplorer, name: &str) {
     fs_spawn(fs, Request::FsRead { path }, FsKind::Reading);
 }
 
+/// Расширение текстовое — файл остаётся во встроенном редакторе. Список
+/// закрытый, а не «всё, что читается как UTF-8»: бинарник с расширением .txt
+/// ядро и так отклоняет, а расширение вида `.xyz` вряд ли кто откроет
+/// просмотрщиком. Файл без точки и dotfile (.gitignore) — тоже текст.
+fn fs_text_ext(name: &str) -> bool {
+    const TEXT: [&str; 12] = [
+        "txt", "md", "log", "json", "csv", "toml", "ini", "cfg", "conf", "rs", "py", "ps1",
+    ];
+    match name.rsplit_once('.') {
+        None => true,
+        Some(("", _)) => true,
+        Some((_, ext)) => TEXT.contains(&ext.to_ascii_lowercase().as_str()),
+    }
+}
+
+/// Открыть файл обработчиком системы (на Windows `explorer.exe` → ShellExecute).
+/// Ядро про этот клик не знает, поэтому статус пишем сами, минуя IPC.
+fn fs_launch_external(fs: &mut FsExplorer, name: &str) {
+    let path = fs_join(&fs.path, name);
+    match sys_open(&path) {
+        Ok(()) => {
+            fs.failed = false;
+            fs.status = format!("Открыто системой: {}", name);
+        }
+        Err(e) => {
+            fs.failed = true;
+            fs.status = format!("{} — {}", name, e);
+        }
+    }
+}
+
 /// Записать открытый файл обратно.
 ///
 /// `Request::FsWrite` перезаписывает целиком — это его назначение: это путь
@@ -623,8 +670,37 @@ fn fs_row_actions(ui: &mut egui::Ui, fs: &mut FsExplorer) {
                     }
                 }
             }
+            // Спросить ИИ — вопрос про то, на что смотрит человек: выделенное
+            // в списке, иначе текущая папка, иначе диски. Клик IPC не делает,
+            // поэтому ни `busy`, ни слива ответа ему не нужно.
+            if ui
+                .button("» Спросить ИИ")
+                .on_hover_text("Открыть панель ИИ с вопросом про выделенное.")
+                .clicked()
+            {
+                let prefill = fs_ask_ai_prefill(fs);
+                fs.ask_ai = Some(prefill);
+            }
         },
     );
+}
+
+/// Вопрос для панели ИИ: про выделенное, иначе про текущую папку, иначе про
+/// сам компьютер. Путь показываем «как есть» (без префикса `\\?\`) — сравнивать
+/// с такой строкой запрещено, см. `fs_pretty`.
+fn fs_ask_ai_prefill(fs: &FsExplorer) -> String {
+    if let Some(name) = &fs.sel {
+        return format!(
+            "Расскажи про {}",
+            fs_pretty(Path::new(&fs_join(&fs.path, name)))
+        );
+    }
+    let here = fs.current_path();
+    if here.is_empty() {
+        String::from("Перечисли диски этого компьютера.")
+    } else {
+        format!("Что мне знать про папку {}?", here)
+    }
 }
 
 /// Шапка колонок списка. Рисуется отдельно от строк и не прокручивается —
@@ -778,7 +854,14 @@ fn fs_pane_list(ui: &mut egui::Ui, fs: &mut FsExplorer) {
                             fs_enter(fs, &d);
                         }
                         if let Some(f) = open {
-                            fs_open_file(fs, &f);
+                            // Текст остаётся во встроенном редакторе — он же для
+                            // него и просмотрщик; всё остальное (картинки, PDF,
+                            // архивы) уходит системе, как двойной клик в «Проводнике».
+                            if fs_text_ext(&f) {
+                                fs_open_file(fs, &f);
+                            } else {
+                                fs_launch_external(fs, &f);
+                            }
                         }
                     });
                 });
@@ -905,6 +988,13 @@ impl VanguardOSApp {
             fs_panes(ui, &mut self.fs);
             fs_row_status(ui, &mut self.fs);
         });
+
+        // Кнопка «Спросить ИИ» не могла звать панель сама: у замыкания окна
+        // захвачено только `self.fs`, а панели нужно всё приложение. Флаг
+        // забираем здесь же, сразу после отрисовки.
+        if let Some(prefill) = self.fs.ask_ai.take() {
+            self.open_ai_panel(prefill);
+        }
     }
 }
 

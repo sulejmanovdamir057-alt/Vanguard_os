@@ -419,6 +419,30 @@ Widgets and features added on top of the original desktop:
   focus the input line. The Enter handler is gated on `!ctx.wants_keyboard_input()`, otherwise it
   would swallow the Enter that submits a typed command. They are checked in `update()` *before*
   the windows are drawn — moving that check later changes which widget sees the key first.
+- **AI panel** (`app.rs::draw_ai_panel`; Ctrl+Space / desktop menu «» Спросить ИИ» / a button in
+  «Файлы»): a right-hand column over everything with the **same** `ai_text_area` feed and the same
+  dialogue history as the terminal — readable from two places, written only through
+  `send_ai_query_text`. Panel context («Файлы» path or notes) is **plain language prepended** to the
+  user message (`ai_context_line`); slash-commands get no context (it would break
+  `starts_with('/')`), and ↑/↓ history stores the raw text only. The «Файлы» button cannot call the
+  panel itself — its window closure captures only `self.fs` — so it sets `FsExplorer::ask_ai` and
+  `draw_fs_window` drains that flag right after the window is drawn (same pattern as `fs_drain`).
+  `FsExplorer::current_path()` is the only outward face of the private `path` field (pretty string,
+  empty at the virtual «Этот компьютер» level); `fs_pretty` stayed module-private for that reason.
+  Both `draw_ai_panel` and the panel's context label avoid taking `&self` inside the window closure:
+  a whole-struct borrow would collide with the field-level `&mut` captures (the label is computed
+  into a local **before** the closure).
+- **Links & system handlers** (`app.rs::sys_open`): URLs found in the chat feed become clickable
+  buttons **under** the feed (`draw_chat_links` — a `TextEdit` cannot host clickable links), and a
+  double-click on a non-text file in «Файлы» hands it to the OS handler (`fs_launch_external`; text
+  extensions stay in the built-in editor, see `fs_text_ext`). `explorer.exe`, deliberately not
+  `cmd /c start`: cmd re-parses its own command line and an `&` from a query URL would arrive as a
+  command separator. No new dependency — the `open` crate is not in the local cargo cache.
+- **Toasts** (`app.rs::draw_toasts`): bottom-right above the taskbar, live 6 s and fade; egui is
+  repaint-on-demand, so an alive toast requests `request_repaint_after(400 ms)` or it would hang
+  on screen until the next mouse move. "ИИ: ответ готов" is raised **only when the feed is not
+  visible** (terminal closed/minimized and panel closed) — sitting in the terminal it would be
+  noise; AI errors and core compile results toast unconditionally. Queue is capped at three.
 - **Script Explorer** (`self.windows.scripts`): lists `vanguard_gen_*.py` and shows the selected
   file's source. RUN goes through `explorer_run` executed *after* `VanguardWindow::show` returns —
   `run_shell_command` borrows all of `self`, which would collide with the window's own
@@ -511,6 +535,7 @@ IPC section above.
 | files over 1 MiB and non-UTF-8 files are refused by `FsRead` | the shell keeps the text in memory and repaints it every frame |
 | create and rename **refuse an occupied name** instead of replacing it | `fs::write` truncates an existing file and `fs::rename` replaces the target silently (std docs: "replacing the original file if `to` already exists"; on Win10 1607+ it matches Unix), so «＋ Файл» used to zero a file whose name was taken and rename used to destroy the victim. `FsCreate` uses `create_new(true)` — an atomic `AlreadyExists` — and `fs_rename` checks `dst.exists()`; `src == dst` is a deliberate no-op, not "occupied". `FsWrite` itself **still overwrites**: it is the SAVE path for the file already open in the editor |
 | the GUI's `✕ Удалить` is **two clicks** | the jail is gone, so a single stray click on a selected row could remove a whole tree. The first click only arms `FsExplorer::confirm` and relabels the button; changing the selection disarms it. This is the GUI's rule, not the core's — `FsDelete` itself will happily delete any non-root path |
+| double-click on a file | `fs_text_ext` decides: text extensions (txt/md/log/json/…; no-dot names and dotfiles too) open in the built-in editor, everything else goes to the OS handler via `fs_launch_external` → `app::sys_open`. No IPC there — the GUI writes `fs.status` itself |
 
 `fs_pretty()` strips Windows' `\\?\` verbatim prefix for **display only** (the path bar would
 otherwise read `\\?\C:\Users\...`); never compare against the pretty string.
