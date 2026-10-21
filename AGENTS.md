@@ -54,14 +54,26 @@ and froze the render for seconds. Everything else stayed in the shell because it
     why `psinit.ps1` builds the repo path at runtime with
     `Join-Path ([Environment]::GetFolderPath('UserProfile')) ...` instead of writing the user
     name out, and why `fs_smoke.ps1` never quotes Russian error strings.
-- `powershell -File tools\dev.ps1 <check|build|smoke|run|core|kill|all>` — **use this instead of
-  calling cargo by hand.** One call kills the stray `vanguard_os`/`vanguard_core` (they lock
+- `powershell -File tools\dev.ps1 <check|build|smoke|run|core|kill|all|clean|publish>` — **use this
+  instead of calling cargo by hand.** One call kills the stray `vanguard_os`/`vanguard_core` (they lock
   `target\debug\*.exe`), runs cargo with stdout/stderr redirected to files, prints every
   `error`/`warning:` line plus the elapsed time, and exits **truthfully** (0 = clean, 1 = findings).
   `all` is the pre-commit gate: check + build + `tools\fs_smoke.ps1` (46 checks against the core
   over raw TCP), ~10 s warm. `run` and `core` build first and then start the binary with the repo
   root as CWD — remember the CWD rules below. `-keep` skips the kill step when the app must stay
   open.
+  - **Cleanup is automatic** (`Invoke-GcArtifacts` + `Invoke-GcTarget`, run ahead of the command
+    switch, so no subcommand has to be remembered): each invocation drops stale
+    `vanguard_tmp_*`/`vanguard_app_*`/`vanguard_script_*` (7 days), `src\`+`tools\*.rs.bak`
+    (7 days) and `%TEMP%\opencode\*.txt` scratch logs (1 day); `target\` cargo-cleans itself once
+    it passes **4 GB** — at most once per 24 h, only on `build|smoke|run|core|all|publish`, and
+    **never during `check`**, whose 0.42 s must not pay the ~370 ms size walk (measured over
+    ~5k files). A fired tier 2 costs the *next* build a full rebuild (~60 s) — that is the price
+    of never running `vg clean` by hand. Overrides: `VANGUARD_GC_HOURS`, `VANGUARD_GC_LIMIT_GB`.
+    The globs deliberately exclude `vanguard_gen_*.py` (the `/apps` registry) and
+    `vanguard_notes.txt`/`vanguard_settings.json`/`vanguard_dialogues.jsonl` (user data) — a
+    loose `vanguard_*` would eat all of them. Tier 2 also skips while either binary is running
+    (`target\*.exe` locked). `clean` just forces both tiers: no age, no threshold, no throttle.
   - It encodes the Windows trap below so you do not have to re-derive it: cargo writes
     `Finished ...` to **stderr**, so `2>` under `$ErrorActionPreference='Stop'` raises
     `NativeCommandError` on a *successful* build. `Invoke-Cargo` relaxes the preference for that

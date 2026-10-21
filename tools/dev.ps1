@@ -14,9 +14,14 @@
 #   pwsh -File tools\dev.ps1 core       build + start the core alone (no GUI)
 #   pwsh -File tools\dev.ps1 kill       kill stray vanguard_os / vanguard_core
 #   pwsh -File tools\dev.ps1 all        check + build + smoke
-#   pwsh -File tools\dev.ps1 clean       cargo clean + stale vanguard_* artifacts
+#   pwsh -File tools\dev.ps1 clean       force both cleanup tiers right now
 #   pwsh -File tools\dev.ps1 publish -m <msg> -- <paths...>
 #                                       gate, then git add + commit - one call
+#
+# Cleanup is AUTOMATIC (see the two-tier block below): every run drops stale
+# vanguard_tmp_/vanguard_app_/vanguard_script_ files (7 days) and scratch
+# logs (1 day), and target\ cargo-cleans itself past $gcLimitGb (4 GB) - at
+# most once a day, only on build-touching commands, never during `check`.
 #
 # `check` is the iteration loop (422 ms with nothing to do, 1.9 s after a source
 # edit - measured). `all` is the pre-commit gate. `publish` collapses the whole
@@ -105,7 +110,119 @@ function Invoke-Gate {
     return ($LASTEXITCODE -eq 0)
 }
 
+# ---- automatic cleanup -------------------------------------------------
+# Runs on EVERY invocation, so nothing has to be remembered. Two tiers:
+#
+#   1. artifacts: glob only, ~10 ms, no measurement, age-guarded (7 days for
+#      generated files, 1 day for scratch logs) so anything freshly made or
+#      still wanted by hand survives.
+#   2. target\: only on commands that rebuild anyway, at most once per
+#      $gcHours, and only when over $gcLimitGb. Measuring costs ~370 ms over
+#      ~5k files, which would double the `check` loop (0.42 s) - so `check`
+#      never runs it at all.
+#
+# When tier 2 fires, the NEXT build pays a full rebuild (~60 s): that is the
+# price of never running `vg clean` by hand. Overrides: VANGUARD_GC_HOURS,
+# VANGUARD_GC_LIMIT_GB.
+#
+# The globs are narrow on purpose. vanguard_gen_*.py is the user's app
+# registry (/apps, /run) and vanguard_notes/settings/dialogues are user data
+# - a loose vanguard_* would eat all three.
+$gcArtifacts = @('vanguard_tmp_*', 'vanguard_app_*', 'vanguard_script_*')
+$gcHours = 24
+$gcLimitGb = 4.0
+if ($env:VANGUARD_GC_HOURS) { $gcHours = [double]$env:VANGUARD_GC_HOURS }
+if ($env:VANGUARD_GC_LIMIT_GB) { $gcLimitGb = [double]$env:VANGUARD_GC_LIMIT_GB }
+$gcMarker = Join-Path $tmp 'vg_gc.marker'
+
+function Invoke-GcArtifacts {
+    param([switch]$force)
+    $n = 0
+    $freed = 0L
+    $artCut = (Get-Date).AddDays(-7)
+    foreach ($pat in $gcArtifacts) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $repo -File -Filter $pat -ErrorAction SilentlyContinue)) {
+            if (-not $force -and $f.LastWriteTime -ge $artCut) { continue }
+            $n++
+            $freed += $f.Length
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+    # src\*.rs.bak left by the old optimize_project.py. Never a recursive walk
+    # of the repo: that would descend into target\ and cost hundreds of ms.
+    foreach ($d in 'src', 'tools') {
+        $p = Join-Path $repo $d
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        foreach ($f in @(Get-ChildItem -LiteralPath $p -Recurse -File -Include '*.rs.bak' -ErrorAction SilentlyContinue)) {
+            if (-not $force -and $f.LastWriteTime -ge $artCut) { continue }
+            $n++
+            $freed += $f.Length
+            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+        }
+    }
+    # own cargo/clippy scratch logs, regenerated on the next run anyway
+    $logCut = (Get-Date).AddDays(-1)
+    foreach ($f in @(Get-ChildItem -LiteralPath $tmp -File -Filter '*.txt' -ErrorAction SilentlyContinue)) {
+        if (-not $force -and $f.LastWriteTime -ge $logCut) { continue }
+        $n++
+        $freed += $f.Length
+        Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+    }
+    if ($n -gt 0) {
+        Write-Host ('GC    removed ' + $n + ' stale files (' + [math]::Round($freed / 1MB, 2) + ' MB)')
+    }
+}
+
+function Invoke-GcTarget {
+    param([switch]$force)
+    # Cargo clean needs every target\*.exe unlocked, otherwise the tree is
+    # left half-deleted. Skip now, retry on the next invocation.
+    if (@(Get-Process vanguard_os, vanguard_core -ErrorAction SilentlyContinue).Count -gt 0) {
+        if (-not $force) { return }
+        Stop-Vanguard
+        Start-Sleep -Milliseconds 300
+    }
+    if (-not $force) {
+        if (Test-Path -LiteralPath $gcMarker) {
+            $age = (Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $gcMarker).LastWriteTimeUtc
+            if ($age.TotalHours -lt $gcHours) { return }
+        }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $size = (Get-ChildItem -LiteralPath (Join-Path $repo 'target') -Recurse -File -ErrorAction SilentlyContinue |
+            Measure-Object Length -Sum).Sum
+        # The marker records the CHECK, not the clean: otherwise this walk
+        # would be paid on every build until target\ crossed the line.
+        Set-Content -LiteralPath $gcMarker -Value (Get-Date).ToString('o')
+        if ($size -lt ($gcLimitGb * 1GB)) {
+            Write-Host ('GC    target\ ' + [math]::Round($size / 1GB, 2) + ' GB kept (< ' + $gcLimitGb + ' GB, ' + [int]$sw.ElapsedMilliseconds + ' ms)')
+            return
+        }
+        Write-Host ('GC    target\ ' + [math]::Round($size / 1GB, 2) + ' GB >= ' + $gcLimitGb + ' GB, cleaning')
+    }
+    $out = Join-Path $tmp 'dev_out.txt'
+    $err = Join-Path $tmp 'dev_err.txt'
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    & cargo clean > $out 2> $err
+    $ErrorActionPreference = $prevEap
+    if ($LASTEXITCODE -ne 0) {
+        Get-Content $out, $err -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+        Write-Host 'GC    FAIL cargo clean (target\ left as is)'
+        return
+    }
+    Set-Content -LiteralPath $gcMarker -Value (Get-Date).ToString('o')
+    Write-Host 'GC    cargo clean - next build is a full rebuild (~60 s)'
+}
+
 $ok = $true
+
+# Tier 1 on every command; tier 2 only where cargo rebuilds anyway. Both run
+# ahead of the switch so `clean` below just forces them.
+Invoke-GcArtifacts
+if (@('build', 'smoke', 'run', 'core', 'all', 'publish') -contains $cmd) {
+    if (-not $keep) { Stop-Vanguard }
+    Invoke-GcTarget
+}
 
 switch ($cmd) {
     'kill' {
@@ -156,24 +273,10 @@ switch ($cmd) {
     }
     'clean' {
         Stop-Vanguard
-        $out = Join-Path $tmp 'dev_out.txt'
-        $err = Join-Path $tmp 'dev_err.txt'
-        Write-Host '--- cargo clean ---'
-        $prevEap = $ErrorActionPreference
-        $ErrorActionPreference = 'Continue'
-        & cargo clean > $out 2> $err
-        $ErrorActionPreference = $prevEap
-        if ($LASTEXITCODE -ne 0) {
-            Get-Content $out, $err -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
-        }
-        Write-Host ('OK    cargo clean  (exit ' + $LASTEXITCODE + ')')
-        # AI-generated leftovers in the repo root. .gitignore keeps them out of
-        # git, but nothing ever deletes them, so they pile up on disk.
-        $stale = @(Get-ChildItem -Path $repo -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -like 'vanguard_app_*' -or $_.Name -like 'vanguard_tmp_*' -or $_.Name -like 'vanguard_script_*' })
-        $freed = 0
-        foreach ($f in $stale) { $freed += $f.Length; Remove-Item -LiteralPath $f.FullName -Force }
-        Write-Host ('OK    removed ' + $stale.Count + ' stale generated files (' + [math]::Round($freed / 1MB, 2) + ' MB)')
+        # Same two functions as the automatic path, only forced: no age limit,
+        # no threshold, no throttle.
+        Invoke-GcTarget -force
+        Invoke-GcArtifacts -force
         $ok = $true
     }
     'publish' {
