@@ -11,9 +11,10 @@ use rand::Rng;
 
 // Подключение внутренних модулей проекта
 use vanguard_os_lib::ai_core::{AiEvent, VanguardAction, configured_model, configured_url};
+use vanguard_os_lib::core::apps;
 use vanguard_os_lib::core::telemetry::SystemMetrics;
 use vanguard_os_lib::core::shell::{script_id_from_path, ShellAction, VanguardShell};
-use vanguard_os_lib::ipc::{FsEntry, FsFile, FsListing, Request};
+use vanguard_os_lib::ipc::{DeviceEntry, DeviceView, FsEntry, FsFile, FsListing, Request, VirtualDriver};
 use crate::desktop::{Desktop, DesktopHost, DesktopIntent, INPUT_FIELD_ID};
 use crate::settings::{self, AppSettings};
 use crate::ui_window::{VanguardWindows, WindowId};
@@ -61,6 +62,53 @@ fn walk_history(
         let end = egui::text::CCursor::new(n);
         state.cursor = egui::text::CCursorRange::one(end).into();
         state.store(ctx, egui::Id::new(INPUT_FIELD_ID));
+    }
+}
+
+/// Порт и адрес браузера (стадия 1): FastAPI-сервер живёт отдельным процессом
+/// python, оболочка его только поднимает при первом открытии; уже поднятый
+/// экземпляр переиспользуется (порт проверяется до спавна).
+const BROWSER_URL: &str = "http://127.0.0.1:8787";
+
+fn browser_port_open() -> bool {
+    std::net::TcpStream::connect_timeout(
+        &"127.0.0.1:8787".parse::<std::net::SocketAddr>().unwrap(),
+        Duration::from_millis(150),
+    )
+    .is_ok()
+}
+
+/// Открывает браузер: сервер уже поднят — сразу sys_open, нет — стартуем
+/// `python browser/server.py` (окно консоли не рисуем) и ждём порт до 5 с.
+/// CWD наследуется от оболочки — там и лежит browser/server.py.
+fn browser_open_system() -> String {
+    if !browser_port_open() {
+        let spawned = std::process::Command::new("python")
+            .arg("browser/server.py")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Err(e) = spawned {
+            return format!("Браузер: не удалось запустить server.py: {}\n", e);
+        }
+        // uvicorn стартует ~0.5–1 с (плюс импорт FastAPI) — опрашиваем порт.
+        let mut ok = false;
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if browser_port_open() {
+                ok = true;
+                break;
+            }
+        }
+        if !ok {
+            return String::from(
+                "Браузер: сервер не поднялся за 5 с — проверьте pip install fastapi uvicorn\n",
+            );
+        }
+    }
+    match sys_open(BROWSER_URL) {
+        Ok(()) => format!("Браузер: открыт {}\n", BROWSER_URL),
+        Err(e) => format!("Браузер: {}\n", e),
     }
 }
 
@@ -302,6 +350,22 @@ pub struct VanguardOSApp {
     // Реестр скриптов для «Рекомендуется» меню «Пуск»; обновляется в update(),
     // пока меню открыто (glob на каждый кадр был бы лишней работой).
     recent_scripts: Vec<(String, String)>,
+    // Лаунчер: выбор в списке приложений, строка статуса и подтверждение
+    // удаления (второй клик — как ✕ Удалить в проводнике).
+    apps_sel: Option<String>,
+    apps_confirm: Option<String>,
+    apps_status: String,
+    // Установленные приложения (id, имя, глиф) для «Все приложения» меню «Пуск»;
+    // пересчитываются только пока меню открыто — там же и recent_scripts.
+    apps_menu: Vec<(String, String, String)>,
+    // Диспетчер устройств: опрос Get-PnPDevice идёт в ядре и в фоне (fs_spawn-
+    // принцип), здесь — готовый список, статус и приём канала; drain — в update().
+    devices: Vec<DeviceEntry>,
+    devices_status: String,
+    devices_pending: Option<Receiver<Result<DeviceView, String>>>,
+    /// Виртуальные драйверы для секции управления — приходят тем же ответом,
+    /// что и дерево (DeviceView), отдельного запроса не требуется.
+    device_drivers: Vec<VirtualDriver>,
     /// Рабочий стол: раскладка иконок, контекстное меню и прочее собственное
     /// состояние. Всё, что рисуется на CentralPanel после заставки, живёт в desktop.rs.
     desktop: Desktop,
@@ -439,6 +503,14 @@ impl VanguardOSApp {
             cmd_hist_pos: None,
             focus_input_pending: false,
             recent_scripts: Vec::new(),
+            apps_sel: None,
+            apps_confirm: None,
+            apps_status: String::new(),
+            apps_menu: Vec::new(),
+            devices: Vec::new(),
+            devices_status: String::new(),
+            devices_pending: None,
+            device_drivers: Vec::new(),
             desktop: Desktop::new(),
             backend_alive: Arc::new(AtomicBool::new(false)),
             ai_model_name: configured_model(),
@@ -656,6 +728,17 @@ impl VanguardOSApp {
                 self.focus_input_pending = true;
             }
             DesktopIntent::RunCommand(cmd) => self.run_shell_command(&cmd),
+            // «Все приложения» → запуск отдельным процессом; ошибка — в чат,
+            // успех — тостом (окно Лаунчера в этот момент может быть закрыто).
+            DesktopIntent::LaunchApp(id) => match self.launch_installed_app(&id) {
+                Ok((name, pid)) => self.toast(format!("▶ Запущено: {} (PID {})", name, pid)),
+                Err(e) => self
+                    .ai_text_area
+                    .push_str(&format!(">> LAUNCH FAILED: {}\n", e)),
+            },
+            // Браузер (стадия 1): системный браузер на localhost:8787; сервер
+            // FastAPI поднимает сама оболочка при первом открытии.
+            DesktopIntent::OpenBrowser => self.browser_open(),
             DesktopIntent::ClearChat => self.clear_chat(),
             DesktopIntent::OpenWindow(id) => self.windows.open(id),
             DesktopIntent::ToggleWindowMinimized(id) => {
@@ -756,8 +839,72 @@ impl VanguardOSApp {
                 std::process::exit(0);
             }
             ShellAction::DisplayOutput(text) => self.ai_text_area.push_str(&format!("{}\n", text)),
+            // Терминальный `cls`: тот же путь, что Ctrl+L и пункт меню стола.
+            ShellAction::ClearChat => self.clear_chat(),
+            ShellAction::OpenPath(target) => self.open_target(&target),
             ShellAction::AiStreamAllowed => {}
         }
+    }
+
+    /// `start <цель>`: установленное приложение (по id или имени) запускаем,
+    /// URL/путь открываем средствами системы — относительный путь берём от
+    /// текущего каталога терминала.
+    fn open_target(&mut self, target: &str) {
+        if let Some(app) = apps::scan_apps("apps").into_iter().find(|a| {
+            a.manifest.id.eq_ignore_ascii_case(target)
+                || a.manifest.name.eq_ignore_ascii_case(target)
+        }) {
+            let msg = match apps::launch_app(&app) {
+                Ok(pid) => format!(">> STARTED: {} (PID {})\n", app.manifest.name, pid),
+                Err(e) => format!(">> START FAILED: {}\n", e),
+            };
+            self.ai_text_area.push_str(&msg);
+            return;
+        }
+        let p = std::path::Path::new(target);
+        let resolved =
+            if target.contains("://") || p.is_absolute() || self.shell.term_cwd.is_empty() {
+                target.to_string()
+            } else {
+                format!("{}\\{}", self.shell.term_cwd, target)
+            };
+        let msg = match sys_open(&resolved) {
+            Ok(()) => format!(">> STARTED: {}\n", resolved),
+            Err(e) => format!(">> START FAILED: {}\n", e),
+        };
+        self.ai_text_area.push_str(&msg);
+    }
+
+    /// Запуск установленного приложения по id — общий путь и для «Пуска», и для
+    /// Лаунчера. Отдаёт (имя, PID): имя нужно, чтобы подписать тост.
+    fn launch_installed_app(&mut self, id: &str) -> Result<(String, u32), String> {
+        let app = apps::scan_apps("apps")
+            .into_iter()
+            .find(|a| a.manifest.id == id)
+            .ok_or_else(|| format!("приложение «{}» не установлено", id))?;
+        let name = app.manifest.name.clone();
+        apps::launch_app(&app).map(|pid| (name, pid))
+    }
+
+    /// Браузер (стадия 1): поднимаем локальный FastAPI-сервер, если его ещё нет,
+    /// и открываем системный браузер на localhost:8787. Всё в фоне — старт
+    /// uvicorn ~1 с, кадр держать нельзя. bg_tasks + токен в чат: тот же
+    /// контур, что у /run.
+    fn browser_open(&mut self) {
+        self.ai_text_area.push_str(">> БРАУЗЕР: поднимаю localhost:8787…\n");
+        self.shell.bg_tasks.fetch_add(1, Ordering::SeqCst);
+        let log_tx = self.shell.log_tx.clone();
+        let bg = Arc::clone(&self.shell.bg_tasks);
+        std::thread::spawn(move || {
+            let msg = browser_open_system();
+            match log_tx {
+                Some(tx) => {
+                    let _ = tx.send(AiEvent::Token(msg));
+                }
+                None => println!("{}", msg), // дубликат фолбэка shell.rs
+            }
+            bg.fetch_sub(1, Ordering::SeqCst);
+        });
     }
 
     // ─── Содержимое окон ─────────────────────────────────────────────
@@ -1486,19 +1633,360 @@ impl VanguardOSApp {
         }
     }
 
-    /// 🚀 Окно Лаунчера / Реестра ИИ-софта: список с кнопкой немедленного запуска.
-    /// Запуск возвращается наружу (как в проводнике): замыкание show() занято
-    /// borrow'ом self.windows.apps, а /run теперь исполняется через try_core_run,
-    /// которому нужно &mut self целиком.
+    /// 🖥️ Диспетчер устройств: реальная аппаратура через `Get-PnPDevice` в ядре
+    /// (только чтение). Опрос — только кнопкой «Обновить»: PowerShell стоит
+    /// ~1 с, каждый кадр его дёргать нельзя. Само рисование без IPC.
+    fn draw_devices_window(&mut self, ctx: &egui::Context) {
+        // Запросы к ядру откладываются и исполняются после show(): замыкание
+        // не может взять &mut self целиком — окно уже держит borrow поля.
+        let mut want_call: Option<Request> = None;
+        self.windows.devices.show(ctx, |ui| {
+            let dim = egui::Color32::from_rgb(85, 85, 85);
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.devices_pending.is_none(), egui::Button::new("⟳ Обновить"))
+                    .clicked()
+                {
+                    want_call = Some(Request::HwDevices);
+                }
+                ui.colored_label(dim, self.devices_status.as_str());
+            });
+            ui.separator();
+
+            if self.devices.is_empty() {
+                ui.colored_label(
+                    egui::Color32::from_rgb(85, 85, 85),
+                    if self.devices_pending.is_some() {
+                        "Опрос драйверов в ядре…"
+                    } else {
+                        "Пусто — нажмите «Обновить»"
+                    },
+                );
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .id_source("devices_list")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    // Список отсортирован в devices_drain: класс, потом имя.
+                    let mut last_class = String::new();
+                    for d in &self.devices {
+                        if d.class != last_class {
+                            last_class = d.class.clone();
+                            ui.add_space(6.0);
+                            let title = if last_class.is_empty() {
+                                "(без класса)"
+                            } else {
+                                last_class.as_str()
+                            };
+                            ui.label(egui::RichText::new(title).strong().size(12.0));
+                        }
+                        ui.horizontal(|ui| {
+                            // Три цвета: OK зелёный, Unknown серый (PnP так
+                            // честно отдаёт исправные HID — это не ошибка),
+                            // всё остальное красное.
+                            let up = d.status.to_ascii_uppercase();
+                            let color = if up == "OK" {
+                                egui::Color32::from_rgb(0, 255, 66)
+                            } else if up.is_empty() || up == "UNKNOWN" {
+                                egui::Color32::from_rgb(150, 150, 160)
+                            } else {
+                                egui::Color32::from_rgb(255, 110, 110)
+                            };
+                            ui.colored_label(color, &d.status);
+                            // У части устройств FriendlyName пуст — показываем id.
+                            if d.name.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(150, 150, 160),
+                                    &d.instance,
+                                );
+                            } else {
+                                ui.label(&d.name);
+                            }
+                        });
+                    }
+                });
+
+            // ── Виртуальные драйверы: модули из drivers/ с тумблером ──
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!(
+                    "Виртуальные драйверы ({})",
+                    self.device_drivers.len()
+                ))
+                .size(13.0)
+                .strong(),
+            );
+            if self.device_drivers.is_empty() {
+                ui.colored_label(dim, "модулей нет — положите drivers/<id>/driver.json");
+            }
+            for d in &self.device_drivers {
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(if d.enabled { "Вкл" } else { "Выкл" })
+                        .clicked()
+                    {
+                        want_call = Some(Request::SetDriver {
+                            id: d.id.clone(),
+                            enabled: !d.enabled,
+                        });
+                    }
+                    ui.label(&d.name);
+                    ui.colored_label(dim, &d.class);
+                    if !d.desc.is_empty() {
+                        ui.colored_label(egui::Color32::from_rgb(120, 120, 130), &d.desc);
+                    }
+                });
+            }
+        });
+        if let Some(req) = want_call {
+            self.devices_call(req);
+        }
+    }
+
+    /// Запрос к ядру для диспетчера (опрос `HwDevices` или тумблер `SetDriver`).
+    /// Принцип fs_spawn: канал на задачу, bg_tasks берётся здесь и снимается
+    /// **в devices_drain** — иначе egui уснёт с непрочитанным ответом в канале.
+    fn devices_call(&mut self, req: Request) {
+        if self.devices_pending.is_some() {
+            self.devices_status = String::from("Предыдущий запрос к ядру ещё идёт…");
+            return;
+        }
+        let (tx, rx) = mpsc::channel::<Result<DeviceView, String>>();
+        self.devices_pending = Some(rx);
+        self.devices_status = match &req {
+            Request::SetDriver { .. } => String::from("Переключение драйвера…"),
+            _ => String::from("Опрос драйверов в ядре…"),
+        };
+        self.shell.bg_tasks.fetch_add(1, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            let payload: Result<DeviceView, String> = (|| {
+                let json = serde_json::to_string(&req)
+                    .map_err(|e| format!("сериализация: {}", e))?;
+                let reply = crate::ipc_client::call(&json);
+                if !reply.ok {
+                    return Err(reply.text.trim().to_string());
+                }
+                serde_json::from_str(&reply.text).map_err(|e| format!("ядро ответило не тем: {}", e))
+            })();
+            let _ = tx.send(payload);
+            // fetch_sub намеренно не здесь — дренирует update(), как у fs_spawn.
+        });
+    }
+
+    /// Чтение ответа опроса: снимает задачу, подводит bg_tasks к нулю и
+    /// сортирует список под дерево окна (класс, потом имя).
+    fn devices_drain(&mut self) {
+        let Some(rx) = &self.devices_pending else { return; };
+        let payload = match rx.try_recv() {
+            Ok(p) => p,
+            Err(mpsc::TryRecvError::Empty) => return,
+            // Поток умер, не отправив ответа: иначе busy и bg_tasks залипнут
+            // навсегда, и repaint-гард будет крутить кадры впустую.
+            Err(mpsc::TryRecvError::Disconnected) => Err(String::from("поток опроса оборвался")),
+        };
+        self.devices_pending = None;
+        self.shell.bg_tasks.fetch_sub(1, Ordering::SeqCst);
+        self.devices_status = match &payload {
+            Ok(view) => {
+                let virt = view.devices.iter().filter(|d| d.virtual_dev).count();
+                format!("Устройств: {} (виртуальных: {})", view.devices.len(), virt)
+            }
+            Err(e) => format!("Ошибка: {}", e),
+        };
+        if let Ok(mut view) = payload {
+            view.devices
+                .sort_by_key(|a| (a.class.to_lowercase(), a.name.to_lowercase()));
+            self.devices = view.devices;
+            self.device_drivers = view.drivers;
+        }
+    }
+
+    /// 🚀 Лаунчер: слева установленные приложения (`apps/`), справа магазин
+    /// (`store/`), ниже — сгенерированные ИИ скрипты. Действия с приложениями
+    /// исполняются прямо в замыкании: там нужны только поля `apps_*` и чистые
+    /// функции `apps::*`. Запуск скрипта возвращается наружу (как в проводнике):
+    /// `/run` идёт в ядро через try_core_run, которому нужно &mut self целиком.
     fn draw_apps_window(&mut self, ctx: &egui::Context) -> Option<String> {
         let mut launch_id: Option<String> = None;
         self.windows.apps.show(ctx, |ui| {
-            ui.vertical_centered(|ui| { ui.heading("CHOOSE APPLICATION TO RUN:"); ui.add_space(5.0); });
+            let installed = apps::scan_apps("apps");
+            let store: Vec<apps::AppInfo> = apps::scan_apps("store")
+                .into_iter()
+                .filter(|s| !installed.iter().any(|i| i.manifest.id == s.manifest.id))
+                .collect();
+
+            // Выбор мог пережить удаление или установку извне — сбрасываем.
+            if let Some(sel) = &self.apps_sel {
+                if !installed.iter().chain(store.iter()).any(|a| &a.manifest.id == sel) {
+                    self.apps_sel = None;
+                    self.apps_confirm = None;
+                }
+            }
+            let sel = self.apps_sel.clone();
+            let sel_in_installed = sel
+                .as_deref()
+                .is_some_and(|s| installed.iter().any(|a| a.manifest.id == s));
+            let sel_in_store =
+                sel.as_deref().is_some_and(|s| store.iter().any(|a| a.manifest.id == s));
+
+            let dim = egui::Color32::from_rgb(85, 85, 85);
+            let pane_h = 150.0;
+            ui.columns(2, |cols| {
+                // ── Левая панель: установленные ──
+                cols[0].label(
+                    egui::RichText::new(format!("Установленные ({})", installed.len()))
+                        .size(13.0)
+                        .strong(),
+                );
+                egui::ScrollArea::vertical()
+                    .id_source("apps_installed")
+                    .max_height(pane_h)
+                    .auto_shrink([false, true])
+                    .show(&mut cols[0], |ui| {
+                        if installed.is_empty() {
+                            ui.colored_label(dim, "пусто — установите из магазина справа");
+                        }
+                        for a in &installed {
+                            let on = sel.as_deref() == Some(a.manifest.id.as_str());
+                            let label =
+                                format!("{}  {} {}", a.manifest.icon, a.manifest.name, a.manifest.version);
+                            let row = ui.selectable_label(on, label);
+                            let row = if a.manifest.desc.is_empty() {
+                                row
+                            } else {
+                                row.on_hover_text(&a.manifest.desc)
+                            };
+                            if row.clicked() {
+                                self.apps_sel = Some(a.manifest.id.clone());
+                                self.apps_confirm = None;
+                            }
+                        }
+                    });
+                cols[0].horizontal(|ui| {
+                    if ui
+                        .add_enabled(sel_in_installed, egui::Button::new("▶ Запустить"))
+                        .clicked()
+                    {
+                        if let Some(a) = installed
+                            .iter()
+                            .find(|a| Some(a.manifest.id.as_str()) == sel.as_deref())
+                        {
+                            self.apps_status = match apps::launch_app(a) {
+                                Ok(pid) => format!("▶ Запущено: {} (PID {})", a.manifest.name, pid),
+                                Err(e) => format!("Ошибка запуска: {}", e),
+                            };
+                        }
+                    }
+                    if ui
+                        .add_enabled(sel_in_installed, egui::Button::new("📂 Папка"))
+                        .clicked()
+                    {
+                        if let Some(a) = installed
+                            .iter()
+                            .find(|a| Some(a.manifest.id.as_str()) == sel.as_deref())
+                        {
+                            self.apps_status = match sys_open(&a.dir.to_string_lossy()) {
+                                Ok(()) => format!("Открыта: {}", a.dir.display()),
+                                Err(e) => format!("Ошибка: {}", e),
+                            };
+                        }
+                    }
+                });
+                cols[0].horizontal(|ui| {
+                    // Удаление — два клика, как ✕ Удалить в проводнике: один
+                    // случайный клик не должен стереть папку.
+                    let armed = sel_in_installed && self.apps_confirm.as_deref() == sel.as_deref();
+                    let label = if armed { "✕ Точно удалить?" } else { "✕ Удалить" };
+                    if ui.add_enabled(sel_in_installed, egui::Button::new(label)).clicked() {
+                        let id = sel.clone().unwrap_or_default();
+                        if armed {
+                            self.apps_status = match apps::uninstall_app(&id) {
+                                Ok(m) => {
+                                    self.apps_sel = None;
+                                    self.apps_confirm = None;
+                                    m
+                                }
+                                Err(e) => format!("Ошибка: {}", e),
+                            };
+                        } else {
+                            self.apps_confirm = sel.clone();
+                            self.apps_status = format!("Удалить «{}»? Нажмите ещё раз.", id);
+                        }
+                    }
+                });
+
+                // ── Правая панель: магазин ──
+                cols[1].label(
+                    egui::RichText::new(format!("Магазин ({})", store.len()))
+                        .size(13.0)
+                        .strong(),
+                );
+                egui::ScrollArea::vertical()
+                    .id_source("apps_store")
+                    .max_height(pane_h)
+                    .auto_shrink([false, true])
+                    .show(&mut cols[1], |ui| {
+                        if store.is_empty() {
+                            ui.colored_label(dim, "пусто — положите приложение в store/<id>/");
+                        }
+                        for a in &store {
+                            let on = sel.as_deref() == Some(a.manifest.id.as_str());
+                            let row = ui.selectable_label(
+                                on,
+                                format!("{}  {}", a.manifest.icon, a.manifest.name),
+                            );
+                            let row = if a.manifest.desc.is_empty() {
+                                row
+                            } else {
+                                row.on_hover_text(&a.manifest.desc)
+                            };
+                            if row.clicked() {
+                                self.apps_sel = Some(a.manifest.id.clone());
+                                self.apps_confirm = None;
+                            }
+                        }
+                    });
+                cols[1].horizontal(|ui| {
+                    if ui
+                        .add_enabled(sel_in_store, egui::Button::new("⬇ Установить"))
+                        .clicked()
+                    {
+                        let id = sel.clone().unwrap_or_default();
+                        self.apps_status = match apps::install_app(&id) {
+                            Ok(m) => m,
+                            Err(e) => format!("Ошибка: {}", e),
+                        };
+                        // Выбор не снимаем: id теперь в installed, и слева
+                        // уже доступны «Запустить» и «Удалить».
+                    }
+                });
+            });
+
+            ui.separator();
+            if self.apps_status.is_empty() {
+                ui.colored_label(dim, "выберите приложение для запуска или установки");
+            } else {
+                let bad = self.apps_status.starts_with("Ошибка");
+                ui.colored_label(
+                    if bad {
+                        egui::Color32::from_rgb(255, 110, 110)
+                    } else {
+                        egui::Color32::from_rgb(0, 255, 66)
+                    },
+                    self.apps_status.as_str(),
+                );
+            }
+            ui.separator();
+
+            // ── Наследие LAUNCHER'а: сгенерированные ИИ скрипты, запуск через /run ──
+            ui.label(egui::RichText::new("Сгенерированные скрипты").size(13.0).strong());
             let mut files = Vec::new();
             if let Ok(entries) = glob("vanguard_gen_*.py") { for e in entries.flatten() { files.push(e); } }
 
             if files.is_empty() {
-                ui.vertical_centered(|ui| { ui.colored_label(egui::Color32::from_rgb(85, 85, 85), "No compiled scripts found."); });
+                ui.colored_label(dim, "No compiled scripts found.");
                 return;
             }
 
@@ -1627,8 +2115,8 @@ impl VanguardOSApp {
     pub fn send_ai_query_text(&mut self, query: String) {
         if query.is_empty() { return; }
 
-        // 1. Дублируем ввод в интерфейс окна
-        self.ai_text_area.push_str(&format!("\nvanguard_root@kernel_sh:~# {}\n", query));
+        // 1. Дублируем ввод в интерфейс окна (приглашение несёт каталог шелла)
+        self.ai_text_area.push_str(&format!("\n{} {}\n", self.shell.term_prompt(), query));
 
         // `/run` уходит в ядро (фон + лог токеном), остальное — локальный шелл;
         // не-AI ветки (вывод текста, выход) исполняет apply_shell_command —
@@ -1849,6 +2337,9 @@ impl eframe::App for VanguardOSApp {
         // каждый кадр без условий, иначе результат зависнет в канале до
         // следующего открытия окна «Файлы», а bg_tasks не упадёт.
         self.fs_drain();
+        // Диспетчер устройств — тот же безусловный дренаж, что у проводника:
+        // ответ обязан дочитаться в том же кадре, иначе bg_tasks залипнет.
+        self.devices_drain();
 
         // egui уходит в сон, когда нет ввода (все request_repaint() живут в
         // окнах, закрытых по умолчанию). Пока ИИ стримится или крутится
@@ -1898,6 +2389,9 @@ impl eframe::App for VanguardOSApp {
         // в фоне (см. app/fs_explorer.rs), здесь только рисование окна.
         self.draw_fs_window(ctx);
 
+        // 🖥️ Диспетчер устройств: реальная аппаратура, опрос кнопкой «Обновить».
+        self.draw_devices_window(ctx);
+
         // 🧬 Окно самообучения: журнал своих диалогов → QLoRA-дообучение модели.
         self.draw_trainer_window(ctx);
 
@@ -1946,6 +2440,11 @@ impl eframe::App for VanguardOSApp {
                 // меню открыто, чтобы не гонять glob каждый кадр.
                 if self.desktop.start_open {
                     self.recent_scripts = recent_scripts_scan();
+                    // Установленные приложения — секция «Все приложения».
+                    self.apps_menu = apps::scan_apps("apps")
+                        .into_iter()
+                        .map(|a| (a.manifest.id, a.manifest.name, a.manifest.icon))
+                        .collect();
                 }
                 let mut host = DesktopHost {
                     win_w: self.win_w,
@@ -1955,6 +2454,7 @@ impl eframe::App for VanguardOSApp {
                     is_ai_streaming: self.is_ai_streaming,
                     bg_tasks: self.shell.bg_tasks.load(Ordering::Relaxed),
                     recent_scripts: &self.recent_scripts,
+                    apps: &self.apps_menu,
                 };
                 let intents = self.desktop.draw(ui, ctx, &mut host);
                 // host держит заимствования полей self, но его последнее использование —

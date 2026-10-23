@@ -4,6 +4,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc::Sender, Arc};
 use std::thread;
+use chrono::{DateTime, Local};
 use rand::Rng;
 use sysinfo::System;
 use glob::glob;
@@ -118,11 +119,146 @@ impl VanguardAI {
     }
 }
 
+/// Разрешение путей терминала: относительный путь — от каталога шелла, пустой
+/// аргумент — сам каталог. Тюльпан (`~`) не поддерживаем: в Windows его нет.
+fn term_resolve(cwd: &str, arg: &str) -> String {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return if cwd.is_empty() { String::from(".") } else { cwd.to_string() };
+    }
+    let p = std::path::Path::new(arg);
+    if p.is_absolute() || cwd.is_empty() {
+        arg.to_string()
+    } else {
+        format!("{}\\{}", cwd, arg)
+    }
+}
+
+/// `dir [путь]`: список каталога в духе Windows — каталоги первыми, потом файлы,
+/// по дате и размеру. Больше 300 записей не печатаем: чат — не `less`.
+fn term_dir(cwd: &str, arg: &str) -> String {
+    let path = term_resolve(cwd, arg);
+    let rd = match fs::read_dir(&path) {
+        Ok(rd) => rd,
+        Err(e) => return format!("vsh: не удалось открыть {}: {}\n", path, e),
+    };
+    let mut dirs: Vec<(String, String)> = Vec::new(); // (дата, имя)
+    let mut files: Vec<(String, String, u64)> = Vec::new(); // (дата, имя, байты)
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let meta = e.metadata().ok();
+        let date = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .map(|st| {
+                let dt: DateTime<Local> = st.into();
+                dt.format("%Y-%m-%d %H:%M").to_string()
+            })
+            .unwrap_or_default();
+        match meta {
+            Some(m) if m.is_dir() => dirs.push((date, name)),
+            Some(m) => files.push((date, name, m.len())),
+            None => files.push((date, name, 0)),
+        }
+    }
+    dirs.sort_by_key(|d| d.1.to_lowercase());
+    files.sort_by_key(|f| f.1.to_lowercase());
+    let (n_dirs, n_files) = (dirs.len(), files.len());
+    let mut lines: Vec<String> = dirs
+        .iter()
+        .map(|(d, n)| format!("{}  {:<8}  {}", d, "<DIR>", n))
+        .chain(files.iter().map(|(d, n, s)| format!("{}  {:>12}  {}", d, s, n)))
+        .collect();
+    let total = lines.len();
+    let mut out = format!("\n{}\n\n", path);
+    for l in lines.drain(..).take(300) {
+        out.push_str(&l);
+        out.push('\n');
+    }
+    if total > 300 {
+        out.push_str(&format!("... и ещё {} записей\n", total - 300));
+    }
+    out.push_str(&format!("\nДиректорий: {}, файлов: {}\n", n_dirs, n_files));
+    out
+}
+
+/// `cd [путь]`: без аргумента — в домашний каталог пользователя. Каталог должен
+/// существовать и быть каталогом; путь нормализуется (хвостовой слэш срезается,
+/// кроме корня диска `C:\`).
+fn term_cd(cwd: &str, arg: &str) -> Result<String, String> {
+    let target = if arg.trim().is_empty() {
+        std::env::var("USERPROFILE").unwrap_or_else(|_| term_resolve(cwd, ""))
+    } else {
+        term_resolve(cwd, arg)
+    };
+    match fs::metadata(&target) {
+        Ok(m) if m.is_dir() => {
+            let mut s = target.trim_end_matches('\\').to_string();
+            if s.len() == 2 && s.as_bytes()[1] == b':' {
+                s.push('\\');
+            }
+            Ok(s)
+        }
+        Ok(_) => Err(format!("vsh: {} — это файл, а не каталог\n", target)),
+        Err(e) => Err(format!("vsh: не удалось открыть {}: {}\n", target, e)),
+    }
+}
+
+/// `type <файл>`: печатает файл, как в cmd. Обрезаем на 64 КиБ (читаем целиком
+/// в буфер) и отказываемся от не-UTF-8 — бинарник в ленте чата не нужен.
+fn term_type(cwd: &str, arg: &str) -> String {
+    let name = arg.trim();
+    if name.is_empty() {
+        return String::from("vsh: укажите файл: type <имя>\n");
+    }
+    let path = term_resolve(cwd, name);
+    let mut f = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) => return format!("vsh: не удалось открыть {}: {}\n", path, e),
+    };
+    use std::io::Read;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let mut over = false;
+    loop {
+        match f.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() + n > 65536 {
+                    over = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+    }
+    match String::from_utf8(buf) {
+        Ok(text) => {
+            let mut out = format!("\n{}\n\n", path);
+            out.push_str(&text);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            if over {
+                out.push_str("\n... (файл обрезан на 64 КиБ)\n");
+            }
+            out
+        }
+        Err(_) => format!("vsh: {} — не текст (не UTF-8)\n", path),
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum ShellAction {
     SystemExit,
     DisplayOutput(String),
     AiStreamAllowed,
+    /// Терминальный `cls`: чат живёт в GUI, поэтому действие описано здесь,
+    /// а исполнение — в app.rs (тот же путь, что Ctrl+L и меню стола).
+    ClearChat,
+    /// `start <цель>`: открыть URL/файл/папку средствами системы. Разбор тут,
+    /// запуск — в app.rs: там живёт `sys_open` и будет реестр приложений.
+    OpenPath(String),
 }
 
 pub struct VanguardShell {
@@ -133,6 +269,9 @@ pub struct VanguardShell {
     // Счётчик незавершённых фоновых задач: UI держит кадр живым, пока он > 0,
     // иначе egui уснёт и лог задачи не дорисуется.
     pub bg_tasks: Arc<AtomicUsize>,
+    /// Текущий каталог терминала (`dir`/`cd`/`type` читают отсюда). Пусто — CWD
+    /// процесса. Своя у каждого шелла: у ядра он на каждое соединение свой.
+    pub term_cwd: String,
 }
 
 impl Default for VanguardShell {
@@ -143,6 +282,7 @@ impl Default for VanguardShell {
             // В точности прежний счётчик: Arc<AtomicUsize>::default() — это
             // Arc::new(AtomicUsize::new(0)).
             bg_tasks: Arc::new(AtomicUsize::new(0)),
+            term_cwd: String::new(),
         }
     }
 }
@@ -151,6 +291,109 @@ impl VanguardShell {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Строка приглашения для GUI-терминала: тот же вид, что раньше был
+    /// захардкожен в app.rs, только с текущим каталогом вместо «~».
+    pub fn term_prompt(&self) -> String {
+        let here = if self.term_cwd.is_empty() {
+            String::from("~")
+        } else {
+            self.term_cwd.clone()
+        };
+        format!("vanguard_root@kernel_sh:{}#", here)
+    }
+
+    /// Команды без слэша — «настоящий» терминал рядом со слеш-командами ядра.
+    /// Возвращает `None`, если текст принадлежит модели: вызывающий в этом
+    /// случае пускает его в ИИ-стрим, как и раньше.
+    fn term_bare_command(&mut self, parts: &[&str], trimmed: &str) -> Option<ShellAction> {
+        let cmd = parts[0].to_ascii_lowercase();
+        let cwd = self.term_cwd.clone();
+        let arg = if parts.len() > 1 {
+            parts[1..].join(" ")
+        } else {
+            String::new()
+        };
+        let action = match cmd.as_str() {
+            "help" | "?" => ShellAction::DisplayOutput(String::from(
+                ">> ТЕРМИНАЛ: help, dir [путь], cd [путь], type <файл>, cls, echo <текст>, start <цель>\n\
+                 >> СИСТЕМА: ipconfig, tasklist, systeminfo, ver, whoami, hostname\n\
+                 >> ЯДРО: /help, /apps, /run <id>, /hardware, /wipe, /reset, /exit\n",
+            )),
+            "dir" | "ls" => ShellAction::DisplayOutput(term_dir(&cwd, &arg)),
+            "cd" => match term_cd(&cwd, &arg) {
+                Ok(dir) => {
+                    self.term_cwd = dir.clone();
+                    ShellAction::DisplayOutput(format!("{}\n", dir))
+                }
+                Err(e) => ShellAction::DisplayOutput(e),
+            },
+            "type" | "cat" => ShellAction::DisplayOutput(term_type(&cwd, &arg)),
+            "cls" | "clear" => ShellAction::ClearChat,
+            // echo печатает всё после ключевого слова — как в cmd; длину берём
+            // у lowercased-копии, она побайтово равна исходному токену.
+            "echo" => {
+                let text = trimmed[cmd.len()..].trim_start();
+                ShellAction::DisplayOutput(format!("{}\n", text))
+            }
+            "start" => {
+                if arg.is_empty() {
+                    ShellAction::DisplayOutput(String::from(
+                        "vsh: укажите цель: start <файл|папка|URL|приложение>\n",
+                    ))
+                } else {
+                    ShellAction::OpenPath(arg)
+                }
+            }
+            "ipconfig" | "tasklist" | "systeminfo" | "ver" | "whoami" | "hostname" => {
+                self.term_run_tool(parts);
+                ShellAction::DisplayOutput(format!(
+                    ">> {} — выполняется в фоне, вывод придёт в чат…\n",
+                    cmd
+                ))
+            }
+            _ => return None,
+        };
+        Some(action)
+    }
+
+    /// Фоновый запуск системной утилиты: вывод придёт токеном в чат, как у
+    /// `/run`. Отдельный процесс, а не реализация на Rust — нужен именно тот
+    /// вывод, что видит пользователь в настоящей Windows. `ver` — встроенная
+    /// команда cmd (отдельного exe у неё нет), остальные — настоящие утилиты.
+    fn term_run_tool(&mut self, parts: &[&str]) {
+        let tool = parts[0].to_ascii_lowercase();
+        let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+        let log_tx = self.log_tx.clone();
+        let bg_tasks = Arc::clone(&self.bg_tasks);
+        bg_tasks.fetch_add(1, Ordering::SeqCst);
+        thread::spawn(move || {
+            let result = if tool == "ver" {
+                Command::new("cmd").args(["/c", "ver"]).output()
+            } else {
+                Command::new(&tool).args(&args).output()
+            };
+            let payload = match result {
+                Ok(o) => {
+                    let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
+                    let e = String::from_utf8_lossy(&o.stderr);
+                    if !e.trim().is_empty() {
+                        s.push_str(&e);
+                    }
+                    s
+                }
+                Err(e) => format!("vsh: не удалось запустить {}: {}\n", tool, e),
+            };
+            match log_tx {
+                Some(tx) => {
+                    let _ = tx.send(AiEvent::Token(payload));
+                }
+                None => println!("{}", payload),
+            }
+            bg_tasks.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
     pub fn handle_command(&mut self, query: &str) -> ShellAction {
         let trimmed = query.trim();
         let cmd_lower = trimmed.to_lowercase();
@@ -225,6 +468,8 @@ impl VanguardShell {
             _ => {
                 if cmd_lower.starts_with('/') {
                     ShellAction::DisplayOutput(format!(">> vsh: command not found: {}\n", cmd_lower))
+                } else if let Some(action) = self.term_bare_command(&parts, trimmed) {
+                    action
                 } else {
                     ShellAction::AiStreamAllowed
                 }

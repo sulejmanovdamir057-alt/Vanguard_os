@@ -1,0 +1,107 @@
+<!doctype html>
+<!-- Vanguard Browser — стадия 1. Раскладка и цвета только здесь, логика — в
+     app.js (собирается из src/main.ts через esbuild). -->
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vanguard Browser</title>
+<style>
+  :root {
+    --bg: #101014; --panel: #1a1a21; --line: #2c2c36; --text: #e4e4ea;
+    --dim: #8d8d99; --accent: #00d44b; --accent2: #68a8ff; --red: #ff6e6e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column; height: 100vh;
+  }
+  header {
+    display: flex; gap: 8px; align-items: center;
+    padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  .logo { color: var(--accent); font-weight: 700; letter-spacing: 1px; margin-right: 8px; }
+  button {
+    background: #26262f; color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 12px; cursor: pointer; font: inherit;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .4; cursor: default; }
+  input {
+    flex: 1; background: #101015; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; font: inherit;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  nav { display: flex; gap: 2px; background: var(--panel); border-bottom: 1px solid var(--line); padding: 0 12px; }
+  nav button { border: none; border-radius: 6px 6px 0 0; background: transparent; color: var(--dim); }
+  nav button.active { background: var(--bg); color: var(--accent); }
+  main { flex: 1; overflow: auto; padding: 16px 20px; }
+  .hidden { display: none !important; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  #page-meta { color: var(--dim); font-size: 12px; margin-bottom: 14px; word-break: break-all; }
+  #page-text { white-space: pre-wrap; word-break: break-word; max-width: 900px; }
+  #page-links { margin-top: 20px; max-width: 900px; }
+  #page-links h3, #sys-devices h3 { font-size: 13px; color: var(--dim); margin: 14px 0 6px; }
+  a.link { display: block; color: var(--accent2); padding: 2px 0; text-decoration: none; }
+  a.link:hover { text-decoration: underline; }
+  footer {
+    padding: 6px 12px; background: var(--panel); border-top: 1px solid var(--line);
+    color: var(--dim); font-size: 12px;
+  }
+  footer.bad { color: var(--red); }
+  .toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+  #sys-status { color: var(--dim); font-size: 12px; }
+  pre {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; white-space: pre-wrap; word-break: break-word;
+    font: 12.5px/1.4 "Cascadia Mono", Consolas, monospace;
+  }
+  .tree { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; max-height: 380px; overflow: auto; }
+  .cls { font-weight: 700; color: var(--accent); margin: 8px 0 2px; font-size: 13px; }
+  .cls:first-child { margin-top: 0; }
+  .row { display: flex; gap: 8px; align-items: baseline; padding: 1px 0; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; }
+  .dot.ok { background: var(--accent); } .dot.unk { background: var(--dim); } .dot.bad { background: var(--red); }
+  .virt { color: var(--accent2); font-size: 11px; border: 1px solid var(--accent2); border-radius: 4px; padding: 0 5px; }
+  .cls-inline { color: var(--dim); font-size: 12px; }
+  .desc { color: var(--dim); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mini { padding: 1px 8px; font-size: 12px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="logo">◎ VANGUARD BROWSER</span>
+    <button id="back" title="Назад">‹</button>
+    <button id="fwd" title="Вперёд">›</button>
+    <input id="addr" placeholder="Адрес: example.com" spellcheck="false">
+    <button id="go">Идти</button>
+  </header>
+  <nav>
+    <button id="tab-page" class="active">Страница</button>
+    <button id="tab-sys">Система</button>
+  </nav>
+  <main>
+    <section id="pane-page">
+      <h1 id="page-title">Новая страница</h1>
+      <div id="page-meta"></div>
+      <div id="page-text">Введите адрес в строке выше — страница откроется в текстовом виде со списком ссылок.</div>
+      <div id="page-links"></div>
+    </section>
+    <section id="pane-sys" class="hidden">
+      <div class="toolbar">
+        <h1>Система Vanguard OS</h1>
+        <button id="sys-refresh">⟳ Обновить</button>
+        <span id="sys-status"></span>
+      </div>
+      <h3 style="font-size:13px;color:var(--dim)">Аппаратура (/hardware ядра)</h3>
+      <pre id="sys-hardware">—</pre>
+      <div id="sys-devices"></div>
+      <h3 style="font-size:13px;color:var(--dim)">Реестр приложений (/apps ядра)</h3>
+      <pre id="sys-apps">—</pre>
+    </section>
+  </main>
+  <footer id="status">Запуск…</footer>
+  <script src="/static/app.js"></script>
+</body>
+</html>

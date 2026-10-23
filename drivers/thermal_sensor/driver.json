@@ -1,0 +1,7 @@
+{
+  "id": "thermal_sensor",
+  "name": "Vanguard Thermal Sensor",
+  "class": "System",
+  "desc": "Мнимый датчик температуры для телеметрии (демо-драйвер)",
+  "enabled": true
+}

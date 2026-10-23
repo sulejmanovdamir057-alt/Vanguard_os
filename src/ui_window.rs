@@ -229,6 +229,7 @@ impl VanguardWindow {
 pub enum WindowId {
     Terminal,
     Monitor,
+    Devices,
     Notes,
     Matrix,
     Cleaner,
@@ -241,9 +242,10 @@ pub enum WindowId {
 
 impl WindowId {
     /// Порядок здесь задаёт порядок кнопок на панели задач и в меню «Пуск».
-    pub const ALL: [WindowId; 10] = [
+    pub const ALL: [WindowId; 11] = [
         WindowId::Terminal,
         WindowId::Monitor,
+        WindowId::Devices,
         WindowId::Notes,
         WindowId::Matrix,
         WindowId::Cleaner,
@@ -262,6 +264,9 @@ impl WindowId {
         match self {
             WindowId::Terminal => "❯",
             WindowId::Monitor => "▦",
+            // ▨ (U+25A8) — сосед ▦/▣ в геометрическом блоке U+25A0–U+25FF:
+            // Segoe UI Symbol закрывает его целиком — та же логика, что у ▣ и ◈ ниже.
+            WindowId::Devices => "▨",
             WindowId::Notes => "✎",
             WindowId::Matrix => "◉",
             WindowId::Cleaner => "⌫",
@@ -282,6 +287,7 @@ impl WindowId {
         match self {
             WindowId::Terminal => "Терминал",
             WindowId::Monitor => "Монитор",
+            WindowId::Devices => "Устройства",
             WindowId::Notes => "Заметки",
             WindowId::Matrix => "Матрица",
             WindowId::Cleaner => "Очистка",
@@ -299,6 +305,7 @@ impl WindowId {
 pub struct VanguardWindows {
     pub terminal: VanguardWindow,
     pub monitor: VanguardWindow,
+    pub devices: VanguardWindow,
     pub notes: VanguardWindow,
     pub matrix: VanguardWindow,
     pub cleaner: VanguardWindow,
@@ -314,10 +321,14 @@ impl VanguardWindows {
         Self {
             terminal: VanguardWindow::new("Vanguard Terminal", 600.0, 440.0),
             monitor: VanguardWindow::new("System Monitor", 480.0, 380.0),
+            // Дерево классов + статусы драйверов: шире монитора не нужно.
+            devices: VanguardWindow::new("Device Manager", 520.0, 420.0),
             notes: VanguardWindow::new("Vanguard Notes", 400.0, 350.0),
             matrix: VanguardWindow::new("SysMatrix Stream", 300.0, 400.0),
             cleaner: VanguardWindow::new("Core Cleaner v1.1", 400.0, 250.0),
-            apps: VanguardWindow::new("Vanguard App Registry", 450.0, 300.0),
+            // Две панели (Установленные / Магазин) плюс секция скриптов:
+            // 450×300 осталось от списка одной кнопки.
+            apps: VanguardWindow::new("Vanguard App Registry", 540.0, 460.0),
             scripts: VanguardWindow::new("Script Explorer", 620.0, 420.0),
             // Проводник шире «Скриптов»: у него ещё и строка пути, и панель
             // действий, и редактор справа.
@@ -340,6 +351,7 @@ impl VanguardWindows {
         match id {
             WindowId::Terminal => &mut self.terminal,
             WindowId::Monitor => &mut self.monitor,
+            WindowId::Devices => &mut self.devices,
             WindowId::Notes => &mut self.notes,
             WindowId::Matrix => &mut self.matrix,
             WindowId::Cleaner => &mut self.cleaner,
@@ -357,6 +369,7 @@ impl VanguardWindows {
         match id {
             WindowId::Terminal => &self.terminal,
             WindowId::Monitor => &self.monitor,
+            WindowId::Devices => &self.devices,
             WindowId::Notes => &self.notes,
             WindowId::Matrix => &self.matrix,
             WindowId::Cleaner => &self.cleaner,

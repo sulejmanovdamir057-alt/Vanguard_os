@@ -1,0 +1,8 @@
+{
+  "id": "clock",
+  "name": "Clock",
+  "entry": "main.py",
+  "icon": "◉",
+  "version": "1.0",
+  "desc": "Системные часы в отдельном окне (Tkinter, обновление раз в секунду)"
+}

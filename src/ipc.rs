@@ -58,6 +58,58 @@ pub struct FsFile {
     pub content: String,
 }
 
+/// Строка диспетчера устройств — поля `Get-PnPDevice` (ядро переименовывает
+/// их в нижний регистр прямо в опросе). Имена и статусы не интерпретируем:
+/// что вернул драйвер, то и показываем.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    /// FriendlyName; у части устройств пуст — окно покажет instance вместо него.
+    #[serde(default)]
+    pub name: String,
+    /// Класс (Display, USB, System …) — заголовок группы, как дерево в Windows.
+    #[serde(default)]
+    pub class: String,
+    /// OK / Unknown / Error — ровно то, что вернул PnP, без нормализации.
+    #[serde(default)]
+    pub status: String,
+    /// InstanceId: идентификатор аппаратуры; при пустом name служит именем.
+    #[serde(default)]
+    pub instance: String,
+    /// true — запись из виртуального драйвера (`drivers/`), а не реальный PnP.
+    #[serde(default)]
+    pub virtual_dev: bool,
+}
+
+/// Один виртуальный драйвер: это же его `drivers/<id>/driver.json` — ядро
+/// читает манифест при опросе и перезаписывает его при переключении `enabled`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VirtualDriver {
+    pub id: String,
+    pub name: String,
+    /// Класс дерева, как у реальных устройств (MEDIA, System, DiskDrive …).
+    #[serde(default)]
+    pub class: String,
+    #[serde(default)]
+    pub desc: String,
+    /// Выключен ли. Хранится в манифесте: состояние переживает перезапуск ядра.
+    #[serde(default = "driver_enabled_default")]
+    pub enabled: bool,
+}
+
+/// Манифест без поля `enabled` — драйвер считается включённым.
+fn driver_enabled_default() -> bool {
+    true
+}
+
+/// Ответ на [`Request::HwDevices`] и [`Request::SetDriver`]: дерево устройств
+/// (реальный PnP + включённые виртуальные) плюс полный перечень драйверов —
+/// окну нужны обе половины, чтобы и дерево показать, и тумблеры отрисовать.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeviceView {
+    pub devices: Vec<DeviceEntry>,
+    pub drivers: Vec<VirtualDriver>,
+}
+
 /// Запрос к ядру. Одна строка JSON на соединение.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -87,6 +139,16 @@ pub enum Request {
     ListScripts,
     /// Счётчик реплик в журнале диалогов (окно Neural Trainer).
     DialogueCount,
+    // ── Диспетчер устройств ──
+    /// Реальная аппаратура машины, **только чтение** (`Get-PnPDevice` в ядре).
+    /// Ответ — [`DeviceView`]; опрос дорог (~1 с на холодный PowerShell),
+    /// поэтому клиент шлёт его по кнопке «Обновить», а не каждый кадр.
+    HwDevices,
+    /// Включить/выключить виртуальный драйвер — переписывает `enabled` в его
+    /// `drivers/<id>/driver.json`. Ответ — свежий [`DeviceView`]: клиенту
+    /// второй запрос не нужен, а сам опрос PnP берётся из кэша (аппаратура
+    /// от переключения не меняется).
+    SetDriver { id: String, enabled: bool },
     // ── Проводник «Файлы» ──
     // Все пути **абсолютные** (`C:\Users\...`); пустая строка в FsList —
     // виртуальный уровень «Этот компьютер», где ядро отдаёт диски. Песочницы

@@ -54,6 +54,9 @@ pub struct DesktopIcon {
 pub enum IconAction {
     FocusInput,
     OpenWindow(WindowId),
+    /// Браузер (стадия 1): системный браузер на localhost:8787 — не окно egui,
+    /// поэтому не живёт в WindowId.
+    OpenBrowser,
 }
 
 /// Намерение стола. Стол сам не вызывает шелл и не пишет в чат — он лишь
@@ -73,6 +76,16 @@ pub enum DesktopIntent {
     ToggleWindowMinimized(WindowId),
     /// Тонкая полоска справа внизу: свернуть все окна (как Show Desktop).
     MinimizeAll,
+    /// Спросить ИИ (пункт контекстного меню): открывает панель ИИ с фокусом в
+    /// её строке ввода. Сам запрос панель собирает и отправляет уже в `app.rs` —
+    /// это состояние приложения, а не поверхность стола.
+    AskAi,
+    /// Запустить установленное приложение из «Все приложения» меню «Пуск»
+    /// (id из `apps/`, не окно — у окон свои намерения через `open_intent`).
+    LaunchApp(String),
+    /// Открыть браузер (стадия 1): системный браузер на localhost:8787; сервер
+    /// FastAPI поднимает сама оболочка при первом открытии.
+    OpenBrowser,
 }
 
 /// Всё, что столу нужно от приложения. Живёт ровно один кадр, собирается
@@ -92,6 +105,9 @@ pub struct DesktopHost<'a> {
     /// Реестр сгенерированных скриптов (id, имя) — раздел «Рекомендуется»
     /// меню «Пуск»; собирает app.rs, и только пока открыто меню.
     pub recent_scripts: &'a [(String, String)],
+    /// Установленные приложения (id, имя, глиф из манифеста) — секция «Все
+    /// приложения» меню «Пуск»; собирает app.rs, только пока открыто меню.
+    pub apps: &'a [(String, String, String)],
 }
 
 /// Состояние стола, принадлежащее только ему.
@@ -298,6 +314,7 @@ impl Desktop {
                 match self.icons[i].action {
                     IconAction::FocusInput => intents.push(DesktopIntent::FocusInput),
                     IconAction::OpenWindow(wid) => intents.push(DesktopIntent::OpenWindow(wid)),
+                    IconAction::OpenBrowser => intents.push(DesktopIntent::OpenBrowser),
                 }
             }
         }
@@ -321,6 +338,10 @@ impl Desktop {
                     ui.set_min_width(235.0);
                     if ui.button("❯  Открыть терминал").clicked() {
                         intents.push(DesktopIntent::FocusInput);
+                        close_menu = true;
+                    }
+                    if ui.button("»  Спросить ИИ").clicked() {
+                        intents.push(DesktopIntent::AskAi);
                         close_menu = true;
                     }
                     if ui.button("▦  Монитор системы").clicked() {
@@ -600,6 +621,7 @@ impl Desktop {
                                 intents.push(match icon.action {
                                     IconAction::FocusInput => DesktopIntent::FocusInput,
                                     IconAction::OpenWindow(wid) => DesktopIntent::OpenWindow(wid),
+                                    IconAction::OpenBrowser => DesktopIntent::OpenBrowser,
                                 });
                                 close = true;
                             }
@@ -650,6 +672,38 @@ impl Desktop {
                                                     close = true;
                                                 }
                                             }
+                                            // Браузер — не окно: строка вне
+                                            // WindowId::ALL, с тем же фильтром поиска.
+                                            if (q.is_empty() || "браузер".contains(&q))
+                                                && start_named_row(ui, "◎", "Браузер", CELL_H)
+                                            {
+                                                intents.push(DesktopIntent::OpenBrowser);
+                                                close = true;
+                                            }
+                                            // Установленные приложения из apps/:
+                                            // своя строка и своё намерение — это
+                                            // не окна, их не открывает open_intent.
+                                            if !host.apps.is_empty() {
+                                                ui.add_space(8.0);
+                                                ui.label(
+                                                    egui::RichText::new("Установленные")
+                                                        .size(11.0)
+                                                        .color(egui::Color32::from_rgb(150, 150, 160)),
+                                                );
+                                                for (id, name, glyph) in host.apps {
+                                                    if !q.is_empty()
+                                                        && !name.to_lowercase().contains(&q)
+                                                    {
+                                                        continue;
+                                                    }
+                                                    if start_named_row(ui, glyph, name, CELL_H) {
+                                                        intents.push(DesktopIntent::LaunchApp(
+                                                            id.clone(),
+                                                        ));
+                                                        close = true;
+                                                    }
+                                                }
+                                            }
                                         },
                                     );
                                 });
@@ -674,6 +728,20 @@ impl Desktop {
                                             intents.push(open_intent(*wid));
                                             close = true;
                                         }
+                                    }
+                                });
+                            }
+                            // Браузер — не окно (стадия 1 открывает системный
+                            // браузер), поэтому отдельной плиткой, а не в ALL;
+                            // счётчик used держит высоту меню стабильной.
+                            if q.is_empty() || "браузер".contains(&q) {
+                                used += 1;
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = TILE_GAP;
+                                    let id = ui.make_persistent_id("start_tile_browser");
+                                    if start_tile(ui, "◎", "Браузер", id, cw, TILE_H) {
+                                        intents.push(DesktopIntent::OpenBrowser);
+                                        close = true;
                                     }
                                 });
                             }
@@ -1013,6 +1081,12 @@ fn start_tile(
 /// подсветка при наведении. Возвращает true по клику — намерение собирает
 /// вызывающий, потому что терминал открывается особым образом ([`open_intent`]).
 fn start_app_row(ui: &mut egui::Ui, wid: WindowId, h: f32) -> bool {
+    start_named_row(ui, wid.glyph(), wid.label(), h)
+}
+
+/// То же, но для установленного приложения: глиф и имя приходят из манифеста
+/// (`apps/`), а не из [`WindowId`].
+fn start_named_row(ui: &mut egui::Ui, glyph: &str, label: &str, h: f32) -> bool {
     let (rect, resp) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
     if resp.hovered() {
@@ -1021,14 +1095,14 @@ fn start_app_row(ui: &mut egui::Ui, wid: WindowId, h: f32) -> bool {
     ui.painter().text(
         egui::pos2(rect.left() + 8.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        wid.glyph(),
+        glyph,
         egui::FontId::proportional(15.0),
         egui::Color32::WHITE,
     );
     ui.painter().text(
         egui::pos2(rect.left() + 34.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
-        wid.label(),
+        label,
         egui::FontId::proportional(12.0),
         egui::Color32::from_rgb(220, 220, 225),
     );
@@ -1058,6 +1132,12 @@ fn default_icons() -> Vec<DesktopIcon> {
             label: WindowId::Monitor.label(),
             hint: "Графики CPU/RAM/Disk и статус ядра",
             action: IconAction::OpenWindow(WindowId::Monitor),
+        },
+        DesktopIcon {
+            glyph: WindowId::Devices.glyph(),
+            label: WindowId::Devices.label(),
+            hint: "Диспетчер устройств: реальная аппаратура и драйверы",
+            action: IconAction::OpenWindow(WindowId::Devices),
         },
         DesktopIcon {
             glyph: WindowId::Notes.glyph(),
@@ -1094,6 +1174,13 @@ fn default_icons() -> Vec<DesktopIcon> {
             label: WindowId::Explorer.label(),
             hint: "Файловый проводник по всем дискам",
             action: IconAction::OpenWindow(WindowId::Explorer),
+        },
+        DesktopIcon {
+            // ◎ (U+25CE) — геометрический блок, весь в Segoe UI Symbol.
+            glyph: "◎",
+            label: "Браузер",
+            hint: "Системный браузер на localhost:8787 (стадия 1)",
+            action: IconAction::OpenBrowser,
         },
         DesktopIcon {
             glyph: WindowId::Trainer.glyph(),

@@ -1,0 +1,7 @@
+{
+  "id": "vanguard_audio",
+  "name": "Vanguard Virtual Audio",
+  "class": "MEDIA",
+  "desc": "Виртуальное аудиоустройство ядра (демо-драйвер)",
+  "enabled": true
+}

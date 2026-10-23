@@ -1,0 +1,7 @@
+{
+  "id": "quantum_storage",
+  "name": "Quantum Virtual Storage",
+  "class": "DiskDrive",
+  "desc": "Виртуальный накопитель; по умолчанию выключен — включите тумблером",
+  "enabled": false
+}

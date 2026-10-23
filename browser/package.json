@@ -1,0 +1,12 @@
+{
+  "name": "vanguard-browser",
+  "private": true,
+  "version": "0.1",
+  "description": "Фронтенд Vanguard Browser: src/main.ts -> static/app.js через esbuild.",
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --outfile=static/app.js --format=iife --target=es2020"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

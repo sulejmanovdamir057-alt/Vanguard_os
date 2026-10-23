@@ -21,13 +21,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use vanguard_os_lib::core::executor::VanguardExecutor;
 use vanguard_os_lib::core::shell::VanguardShell;
 use vanguard_os_lib::core::telemetry::{spawn_telemetry_daemon, SystemMetrics};
-use vanguard_os_lib::ipc::{self, Event, FsEntry, FsFile, FsListing, Request, Response};
+use vanguard_os_lib::ipc::{self, DeviceEntry, DeviceView, Event, FsEntry, FsFile, FsListing, Request, Response, VirtualDriver};
 
 /// `pub(crate)` — не для наружу: так эту же функцию зовёт `src/main.rs`,
 /// подключивший файл модулем `#[path]` ради раздачи одним бинарником.
@@ -148,6 +148,11 @@ fn handle_client(
                 let out = vanguard_os_lib::core::shell::count_dialogue_lines();
                 send(&mut writer, &Response::ok(out.to_string()));
             }
+            // ── Диспетчер устройств: только чтение, опрос через PowerShell ──
+            Request::HwDevices => send(&mut writer, &hw_devices()),
+            Request::SetDriver { id, enabled } => {
+                send(&mut writer, &set_driver(&id, enabled))
+            }
             // ── Проводник «Файлы»: пути абсолютные, песочницы больше нет ──
             Request::FsList { path } => send(&mut writer, &fs_list(&path)),
             Request::FsRead { path } => send(&mut writer, &fs_read(&path)),
@@ -174,7 +179,139 @@ fn dispatch_shell(shell: &mut VanguardShell, query: &str) -> Response {
         // Запрос к ИИ ядро не исполняет — эндпоинт Ollama живёт у клиента.
         // Сообщаем, что строка именно для ИИ-шины, а не слеш-команда.
         ShellAction::AiStreamAllowed => Response::ok("<< AI_STREAM_ALLOWED >>"),
+        // Терминальные `cls`/`start` без слэша: у ядра нет ни чата, ни UI, так
+        // что клиенту возвращаем маркеры, а разбор — на его стороне.
+        ShellAction::ClearChat => Response::ok("<< CLEAR_CHAT >>"),
+        ShellAction::OpenPath(target) => Response::ok(format!("<< OPEN_PATH: {} >>", target)),
     }
+}
+
+/// Кэш сырого JSON `Get-PnPDevice`: PowerShell дорог (~1 с), а переключение
+/// виртуального драйвера реальную аппаратуру не меняет — дерево перечитывать
+/// незачем. Возраст не проверяется: свежесть гарантирует кнопка «Обновить»
+/// (она идёт в `ps_fresh` в обход кэша), а тумблер так мигает мгновенно.
+static PS_CACHE: Mutex<Option<(std::time::Instant, String)>> = Mutex::new(None);
+
+/// Диспетчер устройств (кнопка «Обновить»): свежий `Get-PnPDevice` плюс
+/// виртуальные драйверы. `$` в скрипте безопасен: аргумент уходит в
+/// CreateProcess напрямую, без оболочки. `[string]`-каст в проекциях обязателен:
+/// `$null` стал бы JSON-`null`, который строковое поле не примет, а
+/// `[Console]::OutputEncoding` выправляет кириллицу в pipe (иначе mojibake).
+fn hw_devices() -> Response {
+    match ps_fresh() {
+        Ok(ps) => Response::ok(view_json(&ps)),
+        Err(e) => Response::err(e),
+    }
+}
+
+/// Переключатель виртуального драйвера: пишет `enabled` в его `driver.json`
+/// и возвращает свежий [`DeviceView`] — клиенту не нужен второй запрос.
+/// Путь от id собирается только после проверки: без неё `..` открыл бы
+/// запись куда угодно.
+fn set_driver(id: &str, enabled: bool) -> Response {
+    if id.is_empty() || id == "." || id == ".." || id.contains(['/', '\\']) {
+        return Response::err(format!("недопустимый id: «{}»", id));
+    }
+    let path = Path::new("drivers").join(id).join("driver.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Response::err(format!("драйвера «{}» нет", id)),
+    };
+    let mut driver: VirtualDriver = match serde_json::from_str(&text) {
+        Ok(d) => d,
+        Err(e) => return Response::err(format!("кривой driver.json: {}", e)),
+    };
+    driver.enabled = enabled;
+    let out = match serde_json::to_string_pretty(&driver) {
+        Ok(s) => s,
+        Err(e) => return Response::err(e.to_string()),
+    };
+    if let Err(e) = std::fs::write(&path, out) {
+        return Response::err(format!("не удалось записать {}: {}", path.display(), e));
+    }
+    match ps_cached() {
+        Ok(ps) => Response::ok(view_json(&ps)),
+        Err(e) => Response::err(e),
+    }
+}
+
+/// Свежий опрос PowerShell — путь кнопки «Обновить»; результат кладёт в кэш.
+fn ps_fresh() -> Result<String, String> {
+    let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+        $d = @(Get-PnPDevice | Select-Object \
+        @{n='name';e={[string]$_.FriendlyName}}, @{n='class';e={[string]$_.Class}}, \
+        @{n='status';e={[string]$_.Status}}, @{n='instance';e={[string]$_.InstanceId}}); \
+        ConvertTo-Json -Compress -Depth 3 -InputObject $d";
+    use std::process::Command;
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| format!("powershell не запустился: {}", e))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "PowerShell: {}",
+            err.trim().chars().take(300).collect::<String>()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return Err(String::from("Get-PnPDevice ничего не вернул"));
+    }
+    if let Ok(mut c) = PS_CACHE.lock() {
+        *c = Some((std::time::Instant::now(), text.clone()));
+    }
+    Ok(text)
+}
+
+/// Снимок PnP для путей, где реальная аппаратура не менялась (тумблер
+/// драйвера). Кэша нет или протух (> 60 с) — опрашиваем на месте.
+fn ps_cached() -> Result<String, String> {
+    if let Ok(c) = PS_CACHE.lock() {
+        if let Some((at, text)) = c.as_ref() {
+            if at.elapsed().as_secs() < 60 {
+                return Ok(text.clone());
+            }
+        }
+    }
+    ps_fresh()
+}
+
+/// Все виртуальные драйверы из `drivers/<id>/driver.json`. Кривой манифест или
+/// пустые id/name пропускаются — одно битое приложение не должно ронять дерево.
+fn read_drivers() -> Vec<VirtualDriver> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("drivers") else { return out; };
+    for e in rd.flatten() {
+        if !e.path().is_dir() { continue; }
+        let Ok(t) = std::fs::read_to_string(e.path().join("driver.json")) else { continue; };
+        let Ok(mut d) = serde_json::from_str::<VirtualDriver>(&t) else { continue; };
+        if d.id.is_empty() || d.name.is_empty() { continue; }
+        if d.class.is_empty() { d.class = String::from("System"); }
+        out.push(d);
+    }
+    out.sort_by_key(|d| d.name.to_lowercase());
+    out
+}
+
+/// Собирает ответ: PnP-дерево + включённые виртуальные драйверы отдельными
+/// строками + полный перечень драйверов для секции управления.
+fn view_json(ps_json: &str) -> String {
+    // Кривой кэш лучше пустого дерева: настоящую ошибку Пользователь увидит
+    // по «Обновить» (он идёт через ps_fresh и кэш не читает).
+    let mut devices: Vec<DeviceEntry> = serde_json::from_str(ps_json).unwrap_or_default();
+    let drivers = read_drivers();
+    for d in drivers.iter().filter(|d| d.enabled) {
+        devices.push(DeviceEntry {
+            name: d.name.clone(),
+            class: d.class.clone(),
+            status: String::from("OK"),
+            instance: format!("VIRTUAL\\{}\\0", d.id),
+            virtual_dev: true,
+        });
+    }
+    let view = DeviceView { devices, drivers };
+    serde_json::to_string(&view).unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e))
 }
 
 /// Компиляция Rust-кода ИИ через `rustc -O`. Вынесена из UI-потока оболочки:

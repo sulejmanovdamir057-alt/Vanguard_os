@@ -254,13 +254,16 @@ The wiring spans several places and is easy to half-break:
 
 Layout follows the process split — engine in the lib, GUI in the shell binary:
 
-- `src/lib.rs` — `vanguard_os_lib`. Declares the four public modules below. Both binaries
-  depend on it; that is the only way they share types.
+- `src/lib.rs` — `vanguard_os_lib`. Declares `ipc`, `ai_core` and the `core` block
+  (`shell`/`executor`/`telemetry`/`apps`). Both binaries depend on it; that is the only way
+  they share types.
 - `src/ipc.rs` — the IPC protocol and nothing else: `Request`/`Response`/`Event` enums
   (serde, `tag = "cmd"`/`"kind"`, `snake_case`) plus `CORE_PORT` (7331) and `core_addr()`.
   Single source of truth for the wire format. Add a request here first, then a handler in
   `bin/core.rs`, then a caller. The `Fs*` requests (file explorer) also carry their payload
-  types here (`FsEntry`/`FsListing`/`FsFile`) — see the file-explorer section below.
+  types here (`FsEntry`/`FsListing`/`FsFile`) — see the file-explorer section below. Hardware
+  payloads live here too (`DeviceEntry`/`VirtualDriver`/`DeviceView` for `HwDevices`/
+  `SetDriver`) — see "Windows-like surface" below.
 - `src/ai_core.rs` — the AI request, split into three: `build_request` (env config, message
   assembly, body — **pure, no I/O**, returns `Err(String)` instead of sending events),
   `spawn_ai_request` (thread, agent, POST, non-2xx check) and `stream_sse` (the SSE reader),
@@ -270,12 +273,16 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
   **neither sends `Finished`**, which is exactly what they did when they sent the event
   themselves; do not "fix" that into a `Finished`. Lives in the lib because the future
   `vanguard_ai` assistant will reuse it; the shell calls it over an in-process channel, not IPC.
-- `src/core/shell.rs` — `VanguardShell::handle_command` parses `/…` and returns a `ShellAction`;
-  `execute_ai_action` carries out AI-requested work. Still called from the shell's
-  `check_ai_stream`, but its `/run` and `rustc` paths are now also reachable through the core
-  (see `bin/core.rs`).
+- `src/core/shell.rs` — `VanguardShell::handle_command` parses `/…` **and bare terminal
+  commands** (`term_bare_command`, `term_cwd`/`term_prompt`, slow tools via `term_run_tool`)
+  and returns a `ShellAction`; `execute_ai_action` carries out AI-requested work. Still called
+  from the shell's `check_ai_stream`, but its `/run` and `rustc` paths are now also reachable
+  through the core (see `bin/core.rs`).
 - `src/core/executor.rs` — runs `vanguard_gen_<id>.py` through `python` (`python3` on
   non-Windows). Used by both processes.
+- `src/core/apps.rs` — installed-app registry: `AppManifest`, `scan_apps`/`install_app`/
+  `uninstall_app`/`launch_app` over `apps/<id>/` (`store/` is the tracked catalogue) — see
+  the "Windows-like surface" section below.
 - `src/core/telemetry.rs` — background thread sampling CPU/RAM/disk into
   `Arc<Mutex<SystemMetrics>>` every 500 ms; the UI reads that guard, never calls sysinfo
   directly. Each process spawns its own daemon — the core's is for `/hardware`, the shell's
@@ -284,8 +291,10 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
   each with its own `VanguardShell` (independent dialogue history). Maps `Request` → work:
   `Shell` → `dispatch_shell`, `RunScript`/`CompileRust` → background thread streaming
   `Event::TaskLog` back over the same socket, the rest synchronously — including all seven `Fs*`
-  handlers, which run inside `resolve_path()` (see the file-explorer section). `send()` swallows write
-  errors on purpose — a client that disconnected mid-stream must not panic the core.
+  handlers (inside `resolve_path()`, see the file-explorer section) and the hardware pair
+  `HwDevices`/`SetDriver` (`hw_devices` via PowerShell + the 60 s `PS_CACHE`; `set_driver`
+  rewrites `drivers/<id>/driver.json`). `send()` swallows write errors on purpose — a client
+  that disconnected mid-stream must not panic the core.
 - `src/main.rs` — `vanguard_os` main: spawns the shell's telemetry daemon, then
   `eframe::run_native`. `#![windows_subsystem = "windows"]`, prints nothing to stdout.
 - `src/app.rs` — `VanguardOSApp` implements `eframe::App`; owns boot stages, all windows
@@ -317,13 +326,17 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
   (see "Desktop layout and widgets" below), never against a constant.
 - `src/ui_window.rs` — thin `VanguardWindow` wrapper over `egui::Window`; carries `minimized`,
   which egui has no native concept of (`show()` just returns early). Also holds
-  `WindowId` (the window enum) and `VanguardWindows`, which groups all ten windows so the
+  `WindowId` (the window enum) and `VanguardWindows`, which groups all eleven windows so the
   taskbar can enumerate them via `WindowId::ALL`. Adding a window touches **seven** places:
   the enum, `ALL`, `glyph()`, `label()`, the struct, `new()`, `get()` and `get_mut()` — the
   last two are match arms, so a missed one is a compile error, not a silent ghost.
 - `trainer/vanguard_train.py` — QLoRA self-finetune on the app's own dialogues; launched by
   the Neural Trainer window (`app.rs::start_trainer`) through `python`, logs stream to the GUI
   chat line by line exactly like `/run` does.
+- `browser/` — the web browser, stage 1: `server.py` (FastAPI on 127.0.0.1:8787: static
+  frontend + core TCP bridge + web proxy) and `src/main.ts` bundled to `static/app.js` by
+  esbuild. **Not an egui window** — the shell only spawns the server and opens the system
+  browser; see the "Windows-like surface" section below.
 - `*.rs.bak` are generated artifacts, not source (see below).
 
 ## IPC — the one rule that is easy to get wrong
@@ -407,7 +420,7 @@ Widgets and features added on top of the original desktop:
   struct together**, otherwise it silently never appears. Clicks come back as
   `DesktopIntent::ToggleWindowMinimized` and are applied in `app.rs::apply_desktop_intent`, which is
   **also where a closed window gets opened** (Windows-11 behaviour): the intent only says "toggle",
-  so if `is_open` were not checked there, clicking any of the nine closed apps would silently flip
+  so if `is_open` were not checked there, clicking any closed app would silently flip
   `minimized` and do nothing — that bug shipped once already. A freshly opened Terminal additionally
   gets `focus_input_pending`.
 - **Context menu** (right-click anywhere on the desktop): opens by storing the cursor position in
@@ -497,16 +510,20 @@ Generated artifacts, all relative to the *core's* CWD: `vanguard_gen_<id>.py`,
 - The AI Python-code extractor in `src/core/shell.rs` only matches code fences tagged `python`.
 
 `.gitignore` covers all of the above (`vanguard_gen_*`, `vanguard_app_*`, `vanguard_script_*`,
-`vanguard_tmp_*`, `vanguard_notes.txt`, `*.rs.bak`), so a clean checkout stays clean. The older
-note that "`.gitignore` contains only `/target`" is long obsolete — do not trust it.
+`vanguard_tmp_*`, `vanguard_notes.txt`, `*.rs.bak`, `/apps/` — installed apps are copies of
+`store/` and stay local), so a clean checkout stays clean. The older note that
+"`.gitignore` contains only `/target`" is long obsolete — do not trust it.
 
 External tool requirements for those paths: `python` on PATH for `/run`, `rustc` on PATH for
 AI-generated Rust (the **core** compiles with `rustc -O` — see `src/bin/core.rs::compile_rust`;
 the shell's local `execute_ai_action` still has a `rustc` branch as a fallback when the core is
 down, and both must stay in sync if you change compile flags).
 
-Slash-commands: `/help /apps /run <id> /hardware /wipe /reset /exit`. Anything else that does not
-start with `/` is sent to the LLM.
+Slash-commands: `/help /apps /run <id> /hardware /wipe /reset /exit`. A message whose **first
+word** is a bare terminal command (`help ? dir ls cd type cat cls clear echo start ipconfig
+tasklist systeminfo ver whoami hostname`) is handled locally by `term_bare_command` — dispatch
+is on `parts[0]` alone, so even "help me with X" prints terminal help instead of reaching the
+LLM. Everything else that does not start with `/` is sent to the LLM.
 
 ## File explorer «Файлы» — all drives, sandbox removed (added 2026-10-14, jail cut 2026-10-18)
 
@@ -560,13 +577,90 @@ Smoke test: `%TEMP%\opencode\fs_smoke.ps1` (ASCII-only — PS 5.1 chokes on Cyri
 here) starts a fresh `vanguard_core.exe` over 8.3 short paths, drives the six original requests
 over raw TCP and parses both JSON levels of `Response::Ok`. It asserts behaviour, not message
 text — the error strings are Russian, so substring matching on them is unreliable. **46 checks,
-last run 2026-10-19, all passing** — virtual root listing drives, `mtime` carried, `..`/relative/
+last run 2026-10-21, all passing** — virtual root listing drives, `mtime` carried, `..`/relative/
 blank rejected, drive-root delete and rename refused, `create_new` occupied-name guard, rename
 refusing an occupied target with the victim intact, `FsWrite` still overwriting on the SAVE path,
 and no scratch files left behind. Two PS 5.1 traps it encodes: every `.Count` goes through `@()`
 (a *single* object reports `$null`, not `1`), and the path used for assertions is taken from the
 core's own reply, because `$env:TEMP` is an **8.3 short name** in this environment
 (`C:\Users\73B5~1\...`) while the core echoes the canonical long one.
+
+## Windows-like surface — terminal, apps, devices, drivers, browser (added 2026-10-21)
+
+Five steps that made the fake OS behave like Windows. Rust side is gated by `vg all`
+(check + build + 46/46 smoke, green on 2026-10-21); the browser additionally needs
+`pip install fastapi uvicorn` (already on this machine) and node only to rebuild `app.js`.
+
+### Bare terminal commands (`src/core/shell.rs`)
+
+`handle_command` runs three tiers in order: `/…` slash → `term_bare_command` → LLM. The bare
+tier owns `VanguardShell::term_cwd` (per-shell string, `~` when unset) and `term_prompt()`
+(`vanguard_root@kernel_sh:<cwd>#`). Traps:
+
+- dispatch is on **`parts[0]` only**, no arity guard — "help me with X" runs `help` (see the
+  Slash-commands note above);
+- `echo` prints `trimmed[cmd.len()..]` — everything after the keyword, like cmd;
+- the slow group `ipconfig|tasklist|systeminfo|ver|whoami|hostname` goes through
+  `term_run_tool`: `fetch_add` on `bg_tasks`, a detached thread runs the **real** Windows
+  tool (`ver` is `cmd /c ver` — it has no exe of its own) and streams stdout back as
+  `AiEvent::Token`, the same contour as `/run`. Dropping that increment stalls the output
+  until the next mouse move — the `bg_tasks` invariant in the IPC section applies here too;
+- new `ShellAction`s: `ClearChat` (→ `clear_chat()`) and `OpenPath` (→ `open_target`, which
+  also resolves installed apps).
+
+### Applications — `apps/<id>/`, catalogue `store/` (`src/core/apps.rs`)
+
+| piece | where | behavior |
+|---|---|---|
+| manifest | `apps/<id>/app.json` | `AppManifest { id, name, entry, icon, version, desc }` — installed-state lives in the same file |
+| catalogue | `store/<id>/` (tracked) | install = recursive `copy_dir` store→apps; occupied target **refused**; uninstall = `remove_dir_all`, two-click GUI confirm |
+| launch | `apps::launch_app` | entry by extension (py/bat/cmd/ps1/exe), detached spawn, returns the PID for the toast |
+| guard | `apps::check_id` | rejects `..`/separators/drive-colon — a manifest id becomes a path component |
+
+`apps/` is git-ignored: a fresh checkout shows «Установленные (0)» and the two samples in
+«Магазин» (`store/hello`, `store/clock` — Tkinter, so `python` must be on PATH). Everything
+goes through `app.rs::launch_installed_app` (Start-menu `DesktopIntent::LaunchApp`, the
+«Все приложения» list, the «Запустить» button); `open_target` falls back to an app lookup, so
+`start hello` works from the terminal too. The «Приложения» window (`WindowId::Apps`, 540×460)
+is the one place that both installs and launches.
+
+### Device Manager + virtual drivers («Устройства», `WindowId::Devices`)
+
+- `Request::HwDevices` → `core.rs::hw_devices()` runs `Get-PnPDevice` with `[string]`
+  projections and `[Console]::OutputEncoding = UTF8`, returning `DeviceView { devices,
+  drivers }`. Cold ≈ 3.8 s for ~503 devices — the reason every call is background:
+  `devices_call`/`devices_drain` in `app.rs`, `fetch_add` on `bg_tasks`, drained
+  **unconditionally in `update()`** right after `fs_drain()` (same invariant as the file
+  explorer: a window closing mid-flight must not strand a reply).
+- `drivers/<id>/driver.json` = `VirtualDriver { id, name, class, desc, enabled }` — the
+  manifest doubles as the persisted state. Enabled ones are merged into the PnP tree as
+  `DeviceEntry { virtual_dev: true, status: "OK", instance: "VIRTUAL\…\0" }`; samples:
+  `vanguard_audio`, `thermal_sensor` (enabled), `quantum_storage` (disabled).
+- `Request::SetDriver { id, enabled }` (id checked **before** any path join) rewrites the
+  manifest and answers with the fresh `DeviceView`. It feels instant (≈10 ms) because of
+  `core.rs::PS_CACHE` — a `static Mutex` holding the last `Get-PnPDevice` JSON for 60 s:
+  `SetDriver` and every window render read `ps_cached`, only «Обновить» goes through
+  `ps_fresh`, which also repopulates the cache. `view_json` (merge + sort) runs per read —
+  cheap, and it always reflects the new toggles.
+- Status colour is 3-state: `OK` green, `UNKNOWN` **or empty** gray (PnP honestly reports
+  working HID as Unknown — do not "fix" those to green), anything else red.
+- PS5.1 trap: `Get-Content` displays BOM-less UTF-8 `driver.json` as cp1251 — display only,
+  the file stays byte-clean (`git diff -- drivers/` empty). Assert with
+  `[IO.File]::ReadAllText(..., [Text.Encoding]::UTF8)`, never with console output.
+
+### Browser stage 1 — `browser/` (not a WindowId)
+
+| piece | behavior |
+|---|---|
+| `browser/server.py` | FastAPI bound **only to 127.0.0.1:8787**: serves `static/`, `POST /api/proxy` (server-side fetch → regex reader: title/text/links, 2 MB and 15 s limits), and the core bridge `/api/os/hardware\|devices\|apps` + `POST /api/os/shell\|driver` — `core_call()` speaks the raw IPC protocol over TCP 7331 and reads until `kind` ok/err (the same stop rule as `ipc_client`, reimplemented in Python) |
+| frontend | `browser/src/main.ts` → `npx esbuild src/main.ts --bundle --outfile=static/app.js --format=iife --target=es2020`; `static/app.js` (≈6 KB) is committed — **rebuild it after editing the .ts** |
+| Rust side | `IconAction::OpenBrowser`/`DesktopIntent::OpenBrowser` (both match sites), desktop icon glyph `◎` (U+25CE), Start pinned tile + «Все приложения» row — both search-filter aware, and the tile counts into `used` so the menu height stays stable |
+| spawn | `app.rs::browser_open` → background thread (`bg_tasks` + `AiEvent::Token` log, the `/run` contour): `browser_port_open()` (150 ms `TcpStream::connect_timeout`) → spawn `python browser/server.py` with null stdio **only if the port is closed** → poll ≤ 5 s → `sys_open(BROWSER_URL)`. The server outlives the shell, so the next click reuses the running one |
+
+Pages are fetched **by the server**, never by the frontend — no CORS, and the listener never
+binds anything but loopback. CWD must be the repo root when the shell spawns the server (the
+`.py` path is relative, same rule as `/run`); `server.py` itself resolves everything through
+`__file__`. Stage 2 (WebView2 embedding) is not started.
 
 ## Self-finetune loop — Neural Trainer window (added 2026-10-12)
 
