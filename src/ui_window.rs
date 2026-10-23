@@ -230,6 +230,7 @@ pub enum WindowId {
     Terminal,
     Monitor,
     Devices,
+    Networks,
     Notes,
     Matrix,
     Cleaner,
@@ -242,10 +243,11 @@ pub enum WindowId {
 
 impl WindowId {
     /// Порядок здесь задаёт порядок кнопок на панели задач и в меню «Пуск».
-    pub const ALL: [WindowId; 11] = [
+    pub const ALL: [WindowId; 12] = [
         WindowId::Terminal,
         WindowId::Monitor,
         WindowId::Devices,
+        WindowId::Networks,
         WindowId::Notes,
         WindowId::Matrix,
         WindowId::Cleaner,
@@ -267,6 +269,9 @@ impl WindowId {
             // ▨ (U+25A8) — сосед ▦/▣ в геометрическом блоке U+25A0–U+25FF:
             // Segoe UI Symbol закрывает его целиком — та же логика, что у ▣ и ◈ ниже.
             WindowId::Devices => "▨",
+            // «◉» занята Матрицей, «◎» — иконкой браузера на столе; ◆ (U+25C6)
+            // — тот же геометрический блок U+25A0–U+25FF, целиком в Segoe UI Symbol.
+            WindowId::Networks => "◆",
             WindowId::Notes => "✎",
             WindowId::Matrix => "◉",
             WindowId::Cleaner => "⌫",
@@ -288,6 +293,7 @@ impl WindowId {
             WindowId::Terminal => "Терминал",
             WindowId::Monitor => "Монитор",
             WindowId::Devices => "Устройства",
+            WindowId::Networks => "Сеть",
             WindowId::Notes => "Заметки",
             WindowId::Matrix => "Матрица",
             WindowId::Cleaner => "Очистка",
@@ -306,6 +312,7 @@ pub struct VanguardWindows {
     pub terminal: VanguardWindow,
     pub monitor: VanguardWindow,
     pub devices: VanguardWindow,
+    pub networks: VanguardWindow,
     pub notes: VanguardWindow,
     pub matrix: VanguardWindow,
     pub cleaner: VanguardWindow,
@@ -323,6 +330,9 @@ impl VanguardWindows {
             monitor: VanguardWindow::new("System Monitor", 480.0, 380.0),
             // Дерево классов + статусы драйверов: шире монитора не нужно.
             devices: VanguardWindow::new("Device Manager", 520.0, 420.0),
+            // Адаптеры + адреса одной строкой и Wi-Fi-эфир: шире «Устройств»
+            // — у каждой строки ещё и IPv4/шлюз/DNS под именем.
+            networks: VanguardWindow::new("Network & Internet", 560.0, 440.0),
             notes: VanguardWindow::new("Vanguard Notes", 400.0, 350.0),
             matrix: VanguardWindow::new("SysMatrix Stream", 300.0, 400.0),
             cleaner: VanguardWindow::new("Core Cleaner v1.1", 400.0, 250.0),
@@ -352,6 +362,7 @@ impl VanguardWindows {
             WindowId::Terminal => &mut self.terminal,
             WindowId::Monitor => &mut self.monitor,
             WindowId::Devices => &mut self.devices,
+            WindowId::Networks => &mut self.networks,
             WindowId::Notes => &mut self.notes,
             WindowId::Matrix => &mut self.matrix,
             WindowId::Cleaner => &mut self.cleaner,
@@ -370,6 +381,7 @@ impl VanguardWindows {
             WindowId::Terminal => &self.terminal,
             WindowId::Monitor => &self.monitor,
             WindowId::Devices => &self.devices,
+            WindowId::Networks => &self.networks,
             WindowId::Notes => &self.notes,
             WindowId::Matrix => &self.matrix,
             WindowId::Cleaner => &self.cleaner,

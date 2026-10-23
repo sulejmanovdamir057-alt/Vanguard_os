@@ -14,7 +14,7 @@ use vanguard_os_lib::ai_core::{AiEvent, VanguardAction, configured_model, config
 use vanguard_os_lib::core::apps;
 use vanguard_os_lib::core::telemetry::SystemMetrics;
 use vanguard_os_lib::core::shell::{script_id_from_path, ShellAction, VanguardShell};
-use vanguard_os_lib::ipc::{DeviceEntry, DeviceView, FsEntry, FsFile, FsListing, Request, VirtualDriver};
+use vanguard_os_lib::ipc::{DeviceEntry, DeviceView, FsEntry, FsFile, FsListing, NetAdapter, NetView, NetWifi, Request, VirtualDriver};
 use crate::desktop::{Desktop, DesktopHost, DesktopIntent, INPUT_FIELD_ID};
 use crate::settings::{self, AppSettings};
 use crate::ui_window::{VanguardWindows, WindowId};
@@ -167,21 +167,27 @@ fn launch_app_soft(
     log_tx: &Option<Sender<AiEvent>>,
     app: &apps::AppInfo,
 ) -> Result<AppLaunch, String> {
-    if !apps::is_cs(&app.manifest.entry) {
+    if !apps::is_cs(&app.manifest.entry) && !apps::is_go(&app.manifest.entry) {
         return apps::launch_app(app).map(AppLaunch::Pid);
     }
-    // C#: компиляция (csc ~0.6 с / dotnet — секунды) — в ядре и в фоне, кадр не держим.
-    chat.push_str(&format!(">> C#: «{}» — сборка в ядре…\n", app.manifest.name));
-    bg.fetch_add(1, Ordering::SeqCst);
+    // Скомпилированные входы (C#/Go) собирает ядро — секунды, поэтому в фоне
+    // и под bg_tasks, кадр не держим; итог придёт токеном в чат.
     let dir = app.dir.to_string_lossy().into_owned();
     let entry = app.manifest.entry.clone();
+    let (req, tag) = if apps::is_cs(&entry) {
+        (Request::RunCsApp { dir, entry }, "C#")
+    } else {
+        (Request::RunGoApp { dir, entry }, "GO")
+    };
     let name = app.manifest.name.clone();
+    chat.push_str(&format!(">> {}: «{}» — сборка в ядре…\n", tag, name));
+    bg.fetch_add(1, Ordering::SeqCst);
     let tx = log_tx.clone();
     let own_bg = Arc::clone(bg);
     std::thread::spawn(move || {
-        let line = match core_call(&Request::RunCsApp { dir, entry }) {
+        let line = match core_call(&req) {
             Ok(pid) => format!("▶ Запущено: {} (PID {})\n", name, pid.trim()),
-            Err(e) => format!(">> C# FAILED: {}\n", e),
+            Err(e) => format!(">> {} FAILED: {}\n", tag, e),
         };
         bg_report(&tx, line);
         own_bg.fetch_sub(1, Ordering::SeqCst);
@@ -443,6 +449,17 @@ pub struct VanguardOSApp {
     /// Виртуальные драйверы для секции управления — приходят тем же ответом,
     /// что и дерево (DeviceView), отдельного запроса не требуется.
     device_drivers: Vec<VirtualDriver>,
+    // 🌐 Окно «Сеть»: адаптеры и Wi-Fi-эфир из ядра — тот же fs_spawn-принцип,
+    // что у диспетчера (опрос при первом открытии и по кнопке, drain — в update()).
+    nets: Vec<NetAdapter>,
+    wifi: Vec<NetWifi>,
+    /// Есть ли Wi-Fi-аппаратура вообще: без этого пустой `wifi` ничего не
+    /// значит — «интерфейса нет» и «эфир пуст» разные состояния.
+    wifi_hw: bool,
+    net_status: String,
+    net_pending: Option<Receiver<Result<NetView, String>>>,
+    // 🌍 Индикатор интернета в трее: обновляет фоновый TCP-пробник из new().
+    net_online: Arc<AtomicBool>,
     /// Рабочий стол: раскладка иконок, контекстное меню и прочее собственное
     /// состояние. Всё, что рисуется на CentralPanel после заставки, живёт в desktop.rs.
     desktop: Desktop,
@@ -588,6 +605,12 @@ impl VanguardOSApp {
             devices_status: String::new(),
             devices_pending: None,
             device_drivers: Vec::new(),
+            nets: Vec::new(),
+            wifi: Vec::new(),
+            wifi_hw: false,
+            net_status: String::new(),
+            net_pending: None,
+            net_online: Arc::new(AtomicBool::new(false)),
             desktop: Desktop::new(),
             backend_alive: Arc::new(AtomicBool::new(false)),
             ai_model_name: configured_model(),
@@ -651,6 +674,23 @@ impl VanguardOSApp {
             }
             alive.store(ok, Ordering::Relaxed);
             std::thread::sleep(Duration::from_secs(2));
+        });
+
+        // 🌍 Пробник интернета: TCP-коннект к публичным anycast-DNS без единого
+        // DNS-запроса — резолвер самая частая точка отказа, а нужен признак
+        // «выход в сеть вообще есть». Два адреса подряд: если первый
+        // перехвачен провайдером, второй ещё шанс. Свой поток, как у пробника
+        // бэкенда: кадр egui сеть не должна держать.
+        let net = Arc::clone(&app.net_online);
+        std::thread::spawn(move || loop {
+            const PROBES: [&str; 2] = ["1.1.1.1:443", "8.8.8.8:443"];
+            let ok = PROBES.iter().any(|p| {
+                p.parse::<std::net::SocketAddr>()
+                    .map(|a| TcpStream::connect_timeout(&a, Duration::from_millis(1500)).is_ok())
+                    .unwrap_or(false)
+            });
+            net.store(ok, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_secs(5));
         });
         app
     }
@@ -1939,6 +1979,178 @@ impl VanguardOSApp {
         }
     }
 
+    /// 🌐 Окно «Сеть»: адаптеры с адресами и Wi-Fi-эфир. Только чтение —
+    /// переключать нечего, опрос идёт при первом открытии (статус пуст только
+    /// до первого ответа: и успех, и ошибка его заполняют — автоцикла нет)
+    /// и по кнопке «Обновить». Запрос откладывается до show(), как у devices:
+    /// замыкание держит borrow поля, а net_call — метод всего `self`.
+    fn draw_networks_window(&mut self, ctx: &egui::Context) {
+        let mut want_call = false;
+        self.windows.networks.show(ctx, |ui| {
+            let dim = egui::Color32::from_rgb(85, 85, 85);
+            if self.net_status.is_empty() && self.net_pending.is_none() {
+                want_call = true;
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(self.net_pending.is_none(), egui::Button::new("⟳ Обновить"))
+                    .clicked()
+                {
+                    want_call = true;
+                }
+                ui.colored_label(dim, self.net_status.as_str());
+            });
+            ui.separator();
+
+            if self.nets.is_empty() {
+                ui.colored_label(
+                    dim,
+                    if self.net_pending.is_some() {
+                        "Опрос сети в ядре…"
+                    } else {
+                        "Нет данных — нажмите «Обновить»"
+                    },
+                );
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .id_source("networks_list")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for a in &self.nets {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            // Три цвета: Up зелёный; Disconnected/Disabled —
+                            // серый (честное «разомкнуто», не ошибка, та же
+                            // логика, что у статусов PnP); прочее красное.
+                            let st = a.status.to_ascii_uppercase();
+                            let color = if st == "UP" {
+                                egui::Color32::from_rgb(0, 255, 66)
+                            } else if st.is_empty()
+                                || st.contains("DISCONNECT")
+                                || st.contains("DISABLE")
+                            {
+                                egui::Color32::from_rgb(150, 150, 160)
+                            } else {
+                                egui::Color32::from_rgb(255, 110, 110)
+                            };
+                            ui.colored_label(color, &a.status);
+                            ui.label(egui::RichText::new(&a.name).strong().size(12.0));
+                            ui.colored_label(dim, &a.speed);
+                        });
+                        if !a.desc.is_empty() {
+                            ui.colored_label(egui::Color32::from_rgb(120, 120, 130), &a.desc);
+                        }
+                        // Адреса одной строкой; пустые поля просто не показываем.
+                        let mut row = Vec::new();
+                        if !a.ipv4.is_empty() {
+                            row.push(format!("IPv4: {}", a.ipv4));
+                        }
+                        if !a.gw.is_empty() {
+                            row.push(format!("шлюз: {}", a.gw));
+                        }
+                        if !a.dns.is_empty() {
+                            row.push(format!("DNS: {}", a.dns));
+                        }
+                        if !row.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(160, 160, 170),
+                                row.join("   ·   "),
+                            );
+                        }
+                    }
+                });
+
+            // ── Wi-Fi-эфир ──
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!("Wi-Fi ({})", self.wifi.len()))
+                    .size(13.0)
+                    .strong(),
+            );
+            if !self.wifi_hw {
+                ui.colored_label(dim, "Wi-Fi-аппаратура не найдена");
+            } else if self.wifi.is_empty() {
+                ui.colored_label(dim, "сетей не видно — адаптер выключен или эфир пуст");
+            }
+            for w in &self.wifi {
+                ui.horizontal(|ui| {
+                    // Скрытая сеть приходит с пустым SSID — называем честно.
+                    if w.ssid.is_empty() {
+                        ui.colored_label(dim, "(скрытая сеть)");
+                    } else {
+                        ui.label(&w.ssid);
+                    }
+                    // Цвет сигнала, как у полосок strength в Windows.
+                    let c = if w.signal >= 70 {
+                        egui::Color32::from_rgb(0, 255, 66)
+                    } else if w.signal >= 40 {
+                        egui::Color32::from_rgb(255, 200, 0)
+                    } else {
+                        egui::Color32::from_rgb(255, 110, 110)
+                    };
+                    ui.colored_label(c, format!("{}%", w.signal));
+                });
+            }
+        });
+        if want_call {
+            self.net_call();
+        }
+    }
+
+    /// Запрос к ядру для окна «Сеть» — всегда [`Request::NetStatus`], других
+    /// там нет. Принцип devices_call: канал на задачу, bg_tasks берётся здесь
+    /// и снимается **в net_drain** — иначе egui уснёт с непрочитанным ответом,
+    /// а repaint-гард будет крутить кадры впустую.
+    fn net_call(&mut self) {
+        if self.net_pending.is_some() {
+            self.net_status = String::from("Предыдущий запрос к ядру ещё идёт…");
+            return;
+        }
+        let req = Request::NetStatus;
+        let (tx, rx) = mpsc::channel::<Result<NetView, String>>();
+        self.net_pending = Some(rx);
+        self.net_status = String::from("Опрос сети в ядре…");
+        self.shell.bg_tasks.fetch_add(1, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            let payload: Result<NetView, String> = (|| {
+                let json = serde_json::to_string(&req)
+                    .map_err(|e| format!("сериализация: {}", e))?;
+                let reply = crate::ipc_client::call(&json);
+                if !reply.ok {
+                    return Err(reply.text.trim().to_string());
+                }
+                serde_json::from_str(&reply.text).map_err(|e| format!("ядро ответило не тем: {}", e))
+            })();
+            let _ = tx.send(payload);
+            // fetch_sub намеренно не здесь — дренирует update(), как у fs_spawn.
+        });
+    }
+
+    /// Чтение ответа опроса сети: снимает задачу и подводит bg_tasks к нулю.
+    fn net_drain(&mut self) {
+        let Some(rx) = &self.net_pending else { return; };
+        let payload = match rx.try_recv() {
+            Ok(p) => p,
+            Err(mpsc::TryRecvError::Empty) => return,
+            // Поток умер, не отправив ответа: иначе pending и bg_tasks залипнут
+            // навсегда, и repaint-гард будет крутить кадры впустую.
+            Err(mpsc::TryRecvError::Disconnected) => Err(String::from("поток опроса оборвался")),
+        };
+        self.net_pending = None;
+        self.shell.bg_tasks.fetch_sub(1, Ordering::SeqCst);
+        self.net_status = match &payload {
+            Ok(v) => format!("Адаптеров: {}, сетей Wi-Fi: {}", v.adapters.len(), v.wifi.len()),
+            Err(e) => format!("Ошибка: {}", e),
+        };
+        if let Ok(v) = payload {
+            self.nets = v.adapters;
+            self.wifi = v.wifi;
+            self.wifi_hw = v.wifi_hw;
+        }
+    }
+
     /// 🚀 Лаунчер: слева установленные приложения (`apps/`), справа магазин
     /// (`store/`), ниже — сгенерированные ИИ скрипты. Действия с приложениями
     /// исполняются прямо в замыкании: там нужны только поля `apps_*` и чистые
@@ -2486,6 +2698,9 @@ impl eframe::App for VanguardOSApp {
         // Диспетчер устройств — тот же безусловный дренаж, что у проводника:
         // ответ обязан дочитаться в том же кадре, иначе bg_tasks залипнет.
         self.devices_drain();
+        // 🌐 Ответ опроса сети — тот же безусловный дренаж, что у диспетчера:
+        // ответ обязан дочитаться в том же кадре, иначе bg_tasks залипнет.
+        self.net_drain();
 
         // egui уходит в сон, когда нет ввода (все request_repaint() живут в
         // окнах, закрытых по умолчанию). Пока ИИ стримится или крутится
@@ -2537,6 +2752,10 @@ impl eframe::App for VanguardOSApp {
 
         // 🖥️ Диспетчер устройств: реальная аппаратура, опрос кнопкой «Обновить».
         self.draw_devices_window(ctx);
+
+        // 🌐 Окно «Сеть»: адаптеры/IP/Wi-Fi — тот же отложенный запрос,
+        // что у диспетчера; первое открытие опрашивает ядро само.
+        self.draw_networks_window(ctx);
 
         // 🧬 Окно самообучения: журнал своих диалогов → QLoRA-дообучение модели.
         self.draw_trainer_window(ctx);
@@ -2597,6 +2816,7 @@ impl eframe::App for VanguardOSApp {
                     win_h: self.win_h,
                     windows: &mut self.windows,
                     backend_online: self.backend_alive.load(Ordering::Relaxed),
+                    net_online: self.net_online.load(Ordering::Relaxed),
                     is_ai_streaming: self.is_ai_streaming,
                     bg_tasks: self.shell.bg_tasks.load(Ordering::Relaxed),
                     recent_scripts: &self.recent_scripts,

@@ -28,7 +28,7 @@ use vanguard_os_lib::core::executor::VanguardExecutor;
 use vanguard_os_lib::core::launcher;
 use vanguard_os_lib::core::shell::VanguardShell;
 use vanguard_os_lib::core::telemetry::{spawn_telemetry_daemon, SystemMetrics};
-use vanguard_os_lib::ipc::{self, DeviceEntry, DeviceView, Event, FsEntry, FsFile, FsListing, Request, Response, VirtualDriver};
+use vanguard_os_lib::ipc::{self, DeviceEntry, DeviceView, Event, FsEntry, FsFile, FsListing, NetAdapter, NetView, NetWifi, Request, Response, VirtualDriver};
 
 /// `pub(crate)` — не для наружу: так эту же функцию зовёт `src/main.rs`,
 /// подключивший файл модулем `#[path]` ради раздачи одним бинарником.
@@ -153,8 +153,14 @@ fn handle_client(
             Request::RunCsApp { dir, entry } => {
                 send(&mut writer, &run_cs_app(&dir, &entry));
             }
+            // ── Go-приложения: сборка (go build) и запуск отдельным процессом ──
+            Request::RunGoApp { dir, entry } => {
+                send(&mut writer, &run_go_app(&dir, &entry));
+            }
             // ── Диспетчер устройств: только чтение, опрос через PowerShell ──
             Request::HwDevices => send(&mut writer, &hw_devices()),
+            // ── Сеть: только чтение, опрос PowerShell + netsh ──
+            Request::NetStatus => send(&mut writer, &net_status()),
             Request::SetDriver { id, enabled } => {
                 send(&mut writer, &set_driver(&id, enabled))
             }
@@ -214,6 +220,106 @@ fn hw_devices() -> Response {
         Ok(ps) => Response::ok(view_json(&ps)),
         Err(e) => Response::err(e),
     }
+}
+
+/// Ответ [`Request::NetStatus`] до разбора: то, что PowerShell собрал про
+/// адаптеры, плюс сырой текст netsh — Wi-Fi разбирает [`parse_wifi`] уже
+/// на нашей стороне.
+#[derive(serde::Deserialize)]
+struct NetStatusRaw {
+    #[serde(default)]
+    adapters: Vec<NetAdapter>,
+    #[serde(default)]
+    wifi_hw: bool,
+    #[serde(default)]
+    wifi_text: String,
+}
+
+/// Окно «Сеть» (первое открытие и кнопка «Обновить»): адаптеры с адресами из
+/// PowerShell плюс Wi-Fi-эфир из netsh. Кэша нет — в отличие от драйверов,
+/// сетевые состояния меняются часто, а опрос и так идёт только по запросу.
+/// `$` в скрипте безопасен: аргумент уходит в CreateProcess напрямую, без
+/// оболочки. `[string]`-касты обязательны ($null стал бы JSON-`null`,
+/// который строковое поле не примет), `[Console]::OutputEncoding` выправляет
+/// кириллицу в pipe. Слияние `Get-NetAdapter` и `Get-NetIPConfiguration` —
+/// по имени интерфейса; у адаптера без адресов (или не попавшего в конфиг)
+/// `$c` — `$null`, и все его поля просто придут пустыми.
+fn net_status() -> Response {
+    let script = "[Console]::OutputEncoding=[Text.Encoding]::UTF8; \
+        $cfg=@{}; Get-NetIPConfiguration | ForEach-Object { $cfg[$_.InterfaceAlias]=$_ }; \
+        $a = @(Get-NetAdapter | ForEach-Object { $c = $cfg[$_.Name]; \
+        [pscustomobject]@{ name=[string]$_.Name; status=[string]$_.Status; speed=[string]$_.LinkSpeed; \
+        desc=[string]$_.InterfaceDescription; ipv4=[string](@($c.IPv4Address | ForEach-Object { $_.IPAddress }) -join ', '); \
+        gw=[string](@($c.IPv4DefaultGateway | ForEach-Object { $_.NextHop }) -join ', '); \
+        dns=[string](@($c.DNSServer | Where-Object { $_.AddressFamily -eq 2 } | ForEach-Object { $_.ServerAddresses }) -join ', ') }}); \
+        $hw = @(Get-NetAdapter -IncludeHidden | Where-Object { $_.Name -match 'Wireless|Wi-Fi|802.11|WLAN' \
+        -or $_.InterfaceDescription -match 'Wireless|Wi-Fi|802.11|WLAN' }).Count -gt 0; \
+        $wt = (netsh wlan show networks | Out-String); \
+        ConvertTo-Json -Compress -Depth 5 -InputObject ([pscustomobject]@{ adapters=$a; wifi_hw=[bool]$hw; wifi_text=$wt })";
+    use std::process::Command;
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| format!("powershell не запустился: {}", e));
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return Response::err(e),
+    };
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Response::err(format!(
+            "PowerShell: {}",
+            err.trim().chars().take(300).collect::<String>()
+        ));
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        return Response::err(String::from("Get-NetAdapter ничего не вернул"));
+    }
+    let raw: NetStatusRaw = match serde_json::from_str(&text) {
+        Ok(r) => r,
+        Err(e) => return Response::err(format!("кривой JSON PowerShell: {}", e)),
+    };
+    let view = NetView {
+        adapters: raw.adapters,
+        wifi: parse_wifi(&raw.wifi_text),
+        wifi_hw: raw.wifi_hw,
+    };
+    match serde_json::to_string(&view) {
+        Ok(s) => Response::ok(s),
+        Err(e) => Response::err(e.to_string()),
+    }
+}
+
+/// Разбор `netsh wlan show networks` без привязки к локали: ключ «SSID» не
+/// переводится ни на одной (вывод этой машины — EN, текст ошибок PowerShell
+/// при этом — RU, поэтому на «английские» слова полагаться нельзя), а сигнал —
+/// строка, чьё значение кончается на «%» («Signal : 87%» и «Сигнал : 87%» —
+/// одно и то же). Шапка netsh и строки до первого SSID отбрасываются тем, что
+/// `last_mut()` ещё нет. Пустой SSID — скрытая сеть, имя подставит GUI.
+fn parse_wifi(text: &str) -> Vec<NetWifi> {
+    let mut out: Vec<NetWifi> = Vec::new();
+    for line in text.lines() {
+        let t = line.trim();
+        // «SSID 1 : Имя» — начало новой сети. «BSSID …» сюда не попадает:
+        // префикс у него другой, а netsh без mode=bssid его и не печатает.
+        if t.starts_with("SSID ") {
+            if let Some(v) = t.splitn(2, ':').nth(1) {
+                out.push(NetWifi { ssid: v.trim().to_string(), signal: 0 });
+            }
+            continue;
+        }
+        let Some(v) = t.splitn(2, ':').nth(1) else { continue; };
+        let v = v.trim();
+        if v.ends_with('%') {
+            if let Ok(n) = v.trim_end_matches('%').trim().parse::<u8>() {
+                if let Some(last) = out.last_mut() {
+                    last.signal = n;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Переключатель виртуального драйвера: пишет `enabled` в его `driver.json`
@@ -432,19 +538,30 @@ fn run_cs_app(dir: &str, entry: &str) -> Response {
     }
 }
 
-/// Собственно компиляция + старт. `dir` приходит относительным (`apps/<id>`):
-/// ядро и оболочка делят CWD (правило раздела о runtime side effects), поэтому
-/// резолвим от текущего каталога ядра. `..` и байты NUL отсекаем текстом до
-/// любых проверок на диске; `entry` — только голый файл, как в манифесте.
-fn cs_build_and_run(dir: &str, entry: &str) -> Result<String, String> {
+/// Go-приложение: компиляция и запуск отдельным процессом. Секунды (первый
+/// `go build` греет кэш) — поэтому запросом в ядро, а не вызовом GUI; клиент
+/// держит `bg_tasks`. Ответ — PID строкой, ошибка — хвост вывода сборщика.
+fn run_go_app(dir: &str, entry: &str) -> Response {
+    match go_build_and_run(dir, entry) {
+        Ok(pid) => Response::ok(pid),
+        Err(e) => Response::err(e),
+    }
+}
+
+/// Общая проверка путей компилируемых входов (C#/Go). `dir` приходит
+/// относительным (`apps/<id>`): ядро и оболочка делят CWD (правило раздела о
+/// runtime side effects), поэтому резолвим от текущего каталога ядра. `..` и
+/// байты NUL отсекаем текстом до любых проверок на диске; `entry` — только
+/// голый файл, как в манифесте. csc к тому же режет аргументы по `/`
+/// (проверено: `tools/vlaunch.cs` он читает как опцию) — слэши приводим к
+/// windows-виду здесь же, до того, как путь уйдёт в компилятор.
+fn app_src(dir: &str, entry: &str) -> Result<(PathBuf, PathBuf), String> {
     if dir.contains("..") || dir.contains('\0') {
         return Err(String::from("кривая директория приложения"));
     }
     if entry.contains("..") || entry.contains('/') || entry.contains('\\') || entry.contains('\0') {
         return Err(String::from("кривой файл входа: нужен голый файл вроде main.cs"));
     }
-    // csc режет аргументы по `/` (проверено: `tools/vlaunch.cs` он читает как
-    // опцию) — приводим слэши к windows-виду до того, как путь уйдёт в компилятор.
     let dir = dir.replace('/', "\\");
     let root = if Path::new(&dir).is_absolute() {
         PathBuf::from(dir)
@@ -460,6 +577,12 @@ fn cs_build_and_run(dir: &str, entry: &str) -> Result<String, String> {
     if !src.is_file() {
         return Err(format!("нет файла входа {}", src.display()));
     }
+    Ok((root, src))
+}
+
+/// C#-вход: выбор компилятора по расширению, старт — общий [`spawn_built`].
+fn cs_build_and_run(dir: &str, entry: &str) -> Result<String, String> {
+    let (root, src) = app_src(dir, entry)?;
     let ext = src
         .extension()
         .and_then(|e| e.to_str())
@@ -470,15 +593,88 @@ fn cs_build_and_run(dir: &str, entry: &str) -> Result<String, String> {
         "csproj" => dotnet_build(&root, &src)?,
         other => return Err(format!("не C#-вход: .{}", other)),
     };
-    // Старт — та же политика, что у apps::launch_app: отдельный процесс, потоки
-    // не перехватываем; консольному приложению оболочка без консоли выделит свою.
-    let child = std::process::Command::new(&exe)
-        .current_dir(&root)
+    spawn_built(&exe, &root)
+}
+
+/// Go-вход: та же схема «проверить пути → собрать → запустить», что у C#.
+fn go_build_and_run(dir: &str, entry: &str) -> Result<String, String> {
+    let (root, src) = app_src(dir, entry)?;
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext != "go" {
+        return Err(format!("не Go-вход: .{}", ext));
+    }
+    let exe = go_build(&root, &src)?;
+    spawn_built(&exe, &root)
+}
+
+/// Старт скомпилированного приложения: отдельный процесс, потоки не
+/// перехватываем — та же политика, что у `apps::launch_app`; консольному
+/// приложению оболочка без консоли выделит свою. Отдаёт PID строкой.
+fn spawn_built(exe: &Path, root: &Path) -> Result<String, String> {
+    let child = std::process::Command::new(exe)
+        .current_dir(root)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("не удалось запустить {}: {}", exe.display(), e))?;
     Ok(child.id().to_string())
+}
+
+/// Путь к компилятору Go. Голое имя `go` ищется по PATH процесса ядра — но
+/// оболочка, запущенная из сессии, унаследованной до установки SDK, приносит
+/// PATH без Go (замерено: ядро из harness-шелла отвечает «program not found»).
+/// Поэтому — кандидаты, как у `csc_build`: портативная раскладка
+/// `%LOCALAPPDATA%\Programs\Go` и стандартный путь установщика `C:\Go`.
+fn go_tool() -> Result<PathBuf, String> {
+    let mut cands: Vec<PathBuf> = Vec::new();
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let p = dir.join("go.exe");
+            if p.is_file() {
+                cands.push(p);
+                break;
+            }
+        }
+    }
+    if let Some(la) = std::env::var_os("LOCALAPPDATA") {
+        cands.push(Path::new(&la).join("Programs").join("Go").join("bin").join("go.exe"));
+    }
+    cands.push(PathBuf::from(r"C:\Go\bin\go.exe"));
+    cands.into_iter().find(|p| p.is_file()).ok_or_else(|| {
+        String::from("go.exe не найден: ни в PATH, ни в %LOCALAPPDATA%\\Programs\\Go, ни в C:\\Go — нужен Go SDK")
+    })
+}
+
+/// Одиночный `.go` → exe через `go build -o <temp> file.go`: однофайловый
+/// вход собирается и без go.mod. Результат — в %TEMP%, как у csc (папка
+/// `store/` под git, мусор там остался бы виден в git status).
+fn go_build(root: &Path, src: &Path) -> Result<PathBuf, String> {
+    let go = go_tool()?;
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
+    let parent = src
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("app");
+    let out = std::env::temp_dir().join(format!("vanguard_go_{}_{}.exe", parent, stem));
+    let res = std::process::Command::new(&go)
+        .args(["build", "-o"])
+        .arg(&out)
+        .arg(src)
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("go не запустился (нужен Go SDK в PATH): {}", e))?;
+    if !res.status.success() {
+        return Err(launcher::output_tail(&res.stdout, &res.stderr));
+    }
+    if !out.is_file() {
+        return Err(String::from("go build не создал exe"));
+    }
+    Ok(out)
 }
 
 /// Одиночный `.cs` → exe через csc.exe .NET Framework — он входит в каждую

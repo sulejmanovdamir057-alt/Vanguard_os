@@ -100,6 +100,9 @@ pub struct DesktopHost<'a> {
     pub windows: &'a mut VanguardWindows,
     /// Онлайн ли бэкенд ИИ — обновляет фоновый TCP-пробник из `new()`.
     pub backend_online: bool,
+    /// Есть ли выход в интернет — второй пробник из `new()` (TCP 1.1.1.1:443
+    /// без DNS); точка в трее ведёт по клику в окно «Сеть».
+    pub net_online: bool,
     pub is_ai_streaming: bool,
     pub bg_tasks: usize,
     /// Реестр сгенерированных скриптов (id, имя) — раздел «Рекомендуется»
@@ -485,6 +488,35 @@ impl Desktop {
         if host.bg_tasks > 0 {
             painter.text(egui::pos2(rx, tb_y + TASKBAR_H / 2.0), egui::Align2::RIGHT_CENTER, format!("⚙{}", host.bg_tasks), egui::FontId::proportional(12.0), egui::Color32::from_rgb(255, 200, 0));
             rx -= 26.0;
+        }
+
+        // Точка интернета: зелёная — пробник TCP дошёл, красная — нет.
+        // Семантика именно «выход в сеть», а не «адаптер поднят»: пингуем
+        // публичный anycast-DNS без DNS-резолва (см. net_online в app.rs).
+        // Клик открывает окно «Сеть» — там и адаптеры, и адреса.
+        let net_c = egui::pos2(rx - 16.0, tb_y + TASKBAR_H / 2.0);
+        painter.circle_filled(
+            net_c,
+            4.0,
+            if host.net_online {
+                egui::Color32::from_rgb(80, 220, 120)
+            } else {
+                egui::Color32::from_rgb(255, 80, 80)
+            },
+        );
+        let net_resp = ui.interact(
+            egui::Rect::from_center_size(net_c, egui::vec2(16.0, 16.0)),
+            egui::Id::new("taskbar_net_dot"),
+            egui::Sense::click(),
+        );
+        let net_clicked = net_resp.clicked();
+        net_resp.on_hover_text(if host.net_online {
+            "Интернет: есть — открыть окно «Сеть»"
+        } else {
+            "Интернет: не найден — открыть окно «Сеть»"
+        });
+        if net_clicked {
+            intents.push(DesktopIntent::OpenWindow(WindowId::Networks));
         }
 
         // Точка бэкенда ИИ: зелёная — ядро на связи, красная — Ollama молчит.
@@ -1138,6 +1170,12 @@ fn default_icons() -> Vec<DesktopIcon> {
             label: WindowId::Devices.label(),
             hint: "Диспетчер устройств: реальная аппаратура и драйверы",
             action: IconAction::OpenWindow(WindowId::Devices),
+        },
+        DesktopIcon {
+            glyph: WindowId::Networks.glyph(),
+            label: WindowId::Networks.label(),
+            hint: "Адаптеры, IP/шлюз/DNS и Wi-Fi-эфир",
+            action: IconAction::OpenWindow(WindowId::Networks),
         },
         DesktopIcon {
             glyph: WindowId::Notes.glyph(),

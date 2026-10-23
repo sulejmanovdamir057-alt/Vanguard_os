@@ -622,12 +622,13 @@ tier owns `VanguardShell::term_cwd` (per-shell string, `~` when unset) and `term
 |---|---|---|
 | manifest | `apps/<id>/app.json` | `AppManifest { id, name, entry, icon, version, desc }` — installed-state lives in the same file |
 | catalogue | `store/<id>/` (tracked) | install = recursive `copy_dir` store→apps; occupied target **refused**; uninstall = `remove_dir_all`, two-click GUI confirm |
-| launch | `apps::launch_app` | entry by extension (py/bat/cmd/ps1/exe), detached spawn, returns the PID for the toast; `.cs`/`.csproj` сюда не входят — их компиляция идёт в ядре, см. ниже |
+| launch | `apps::launch_app` | entry by extension (py/bat/cmd/ps1/exe), detached spawn, returns the PID for the toast; `.cs`/`.csproj`/`.go` сюда не входят — их компиляция идёт в ядре, см. ниже |
 | guard | `apps::check_id` | rejects `..`/separators/drive-colon — a manifest id becomes a path component |
 
-`apps/` is git-ignored: a fresh checkout shows «Установленные (0)» and the three samples in
+`apps/` is git-ignored: a fresh checkout shows «Установленные (0)» and the four samples in
 «Магазин» (`store/hello`, `store/clock` — Tkinter, so `python` must be on PATH; `store/hello_cs`
-— WinForms на C#, собирается csc'ом при первом запуске). Everything
+— WinForms на C#, собирается csc'ом при первом запуске; `store/hello_go` — консольный Go,
+собирается `go build` при первом запуске). Everything
 goes through `app.rs::launch_installed_app` (Start-menu `DesktopIntent::LaunchApp`, the
 «Все приложения» list, the «Запустить» button); `open_target` falls back to an app lookup, so
 `start hello` works from the terminal too. The «Приложения» window (`WindowId::Apps`, 540×460)
@@ -693,6 +694,38 @@ AI-генерацию C# **не добавляли**: `CreateScript` по-пре
 `action_type` — лишний риск для протокола (см. предупреждение про `generate_system_prompt`).
 `apps/` по-прежнему наполняется руками или извне.
 
+### Go-приложения (added 2026-10-23)
+
+**Вход `.go`.** `apps::is_go()` узнаёт файл `.go`; запуск — не через `launch_app`, а запросом
+`Request::RunGoApp { dir, entry }` в ядро, **та же кухня, что у C#** (секунды, `bg_tasks`,
+итог токеном в чат). В `launch_app_soft` ветки C#/Go сходятся в пару `(req, tag)` («C#»/«GO» —
+общие строки «собираю» и «FAILED» уже не расползутся); `launch_app` держит defensive-арму
+`is_go` с понятной ошибкой на случай, если её кто-то обойдёт.
+
+Компиляция (`core.rs::go_build_and_run`) — общий с C# каркас: `app_src()` (guards: `..`/NUL
+текстом до проверок на диске, `/`→`\`, корень от CWD ядра, файл входа существует) и
+`spawn_built()` (отдельный процесс, stdin/stderr null — консоль выделяется сама). Сборка:
+
+`go build -o %TEMP%\vanguard_go_<папка>_<имя>.exe <file.go>` — **без go.mod**: однофайловый
+вход собирается в command-line-files режиме; результат в `%TEMP%`, как у csc (`store/` под git,
+мусор там остался бы виден в `git status`).
+
+Установка SDK на этой машине: winget-пакет `GoLang.Go` — только machine-MSI (UAC из фона
+невозможен) → **portable zip** `https://dl.google.com/go/go1.27.0.windows-amd64.zip` в
+`%LOCALAPPDATA%\Programs\Go`, PATH User += `<каталог>\bin`. Две ловушки: размер архива ровно
+**78 924 880 байт (75.2 МБ)** — «обрезки на 75 МБ» не было, неверны были пороги проверки
+(три «неудачных» скачивания добывали полный файл); и архив отдаёт **вложенный `go\`** —
+содержимое поднимается на уровень выше, иначе `bin\go.exe` не там, куда указал PATH.
+
+**`go_tool()` — ловушка старого PATH** (замерено живым тестом 2026-10-23): ядро,
+унаследовавшее окружение сессии, запущенной до установки Go, отвечает io-error
+«program not found». Фолбэк-кандидаты, как у `csc_build`: PATH →
+`%LOCALAPPDATA%\Programs\Go\bin\go.exe` → `C:\Go\bin\go.exe`.
+
+Пример — `store/hello_go` (иконка ●): печатает три строки и засыпает на 10 секунд — stdin
+закрыт (`Stdio::null`), Enter в консоли процесса не работает, таймер честнее. AI-генерацию Go
+**не добавляли** — та же причина, что и у C#: `CreateScript` по-прежнему python/rust/bash.
+
 ### Device Manager + virtual drivers («Устройства», `WindowId::Devices`)
 
 - `Request::HwDevices` → `core.rs::hw_devices()` runs `Get-PnPDevice` with `[string]`
@@ -716,6 +749,42 @@ AI-генерацию C# **не добавляли**: `CreateScript` по-пре
 - PS5.1 trap: `Get-Content` displays BOM-less UTF-8 `driver.json` as cp1251 — display only,
   the file stays byte-clean (`git diff -- drivers/` empty). Assert with
   `[IO.File]::ReadAllText(..., [Text.Encoding]::UTF8)`, never with console output.
+
+### Сеть — окно и индикатор («Сеть», `WindowId::Networks`, added 2026-10-23)
+
+- `Request::NetStatus` → `NetView { adapters, wifi, wifi_hw }` (грузовые типы в `ipc.rs`,
+  как у `Fs*`/`Hw*`). `core.rs::net_status()` — **один** PowerShell-скрипт: `Get-NetAdapter` +
+  `Get-NetIPConfiguration`, слияние по имени интерфейса (хэш `$cfg[InterfaceAlias]` — у
+  адаптера без конфига `$c` = `$null`, поля просто придут пустыми), `wifi_hw` по
+  `Get-NetAdapter -IncludeHidden` + regex `Wireless|Wi-Fi|802.11|WLAN` (Name/Description),
+  сырой netsh → `wifi_text`. **Кэша нет** — в отличие от драйверов (`PS_CACHE` 60 с): сетевые
+  состояния меняются чаще, а опрос и так идёт только по запросу.
+- `parse_wifi()` — locale-устойчив: ключ `SSID` не переводится ни в одной локали, а сигнал —
+  строка, чьё значение после двоеточия кончается на `%` («Signal : 87%» = «Сигнал : 87%»).
+  На «английские» слова полагаться нельзя: вывод netsh на этой машине EN, тексты ошибок
+  PowerShell — RU. Шапка отбрасывается тем, что `last_mut()` ещё нет; пустой SSID = скрытая
+  сеть, имя подставляет GUI.
+- GUI (`app.rs`): `draw_networks_window`/`net_call`/`net_drain` — devices-паттерн дословно
+  (канал на задачу, `bg_tasks` берётся в call и снимается **в drain**, drain безусловный в
+  `update()`). Авто-опрос при первом открытии по условию `net_status.is_empty() &&
+  net_pending.is_none()` — статус заполняется и успехом, и ошибкой, цикла не бывает;
+  `want_call` откладывается до конца `show()`, как у devices. Глиф `◆` (U+25C6 — «◉» занята
+  Матрицей, «◎» — иконкой браузера), окно «Network & Internet» 560×440.
+- Индикатор в трее: `net_online: Arc<AtomicBool>` — пробник TCP `1.1.1.1:443` с fallback
+  `8.8.8.8:443` (**без DNS** — резолвер самая частая точка отказа; два адреса подряд, если
+  первый перехвачен провайдером), таймаут 1.5 с, интервал 5 с, свой поток в `new()` рядом с
+  пробником бэкенда (в `update()` его держать нельзя — кадр держал бы сеть). Точка слева от
+  backend-точки (центр `rx - 16.0`), hover — состояние, клик —
+  `DesktopIntent::OpenWindow(WindowId::Networks)`.
+- **Честность на этой машине**: Wi-Fi-аппаратуры в PnP нет вообще — `netsh` отвечает «There is
+  no wireless interface on the system», а `Get-NetAdapter -IncludeHidden` (17 адаптеров) не
+  содержит ни одного Wireless/Wi-Fi → `wifi_hw=false` → окно показывает «Wi-Fi-аппаратура не
+  найдена». В `Win32_NetworkAdapter` TP-Link USB и «Microsoft Wi-Fi Direct Virtual Adapter» ×2
+  значатся пустыми призраками (PNPDeviceID пуст) — им верить нельзя, они и создали в прошлый
+  раз ложное впечатление, что Wi-Fi есть.
+- Сетка «Пуска» с 12 окнами не ломается: было 3 ряда плиток + ряд браузера = 4, стало 12
+  плиток = 3 ряда + браузер = 4 (`GRID_ROWS=3`, `rest` saturating — строка меньше трёх уже
+  не бывает, а запас есть).
 
 ### Browser stage 1 — `browser/` (not a WindowId)
 

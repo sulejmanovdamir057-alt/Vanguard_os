@@ -61,6 +61,16 @@ pub fn is_cs(entry: &str) -> bool {
     )
 }
 
+/// Go-вход (`.go`): сборка `go build` — тяжёлый путь через ядро
+/// (`Request::RunGoApp`), ровно как у C# — см. [`is_cs`]. `go` должен быть
+/// в PATH ядра, иначе запрос вернёт понятную ошибку вместо запуска.
+pub fn is_go(entry: &str) -> bool {
+    matches!(
+        entry.to_ascii_lowercase().rsplit_once('.').map(|(_, e)| e),
+        Some("go")
+    )
+}
+
 /// Идентификатор должен быть именем папки, а не путём: без этого install/uninstall
 /// открыли бы переход на уровень выше прямо из строки запроса.
 fn check_id(id: &str) -> Result<(), String> {
@@ -148,6 +158,11 @@ pub fn launch_app(app: &AppInfo) -> Result<u32, String> {
         other if is_cs(other) => {
             return Err(String::from(
                 "C#-вход: компиляция идёт в ядре (Request::RunCsApp), не через launch_app",
+            ))
+        }
+        other if is_go(other) => {
+            return Err(String::from(
+                "Go-вход: сборка идёт в ядре (Request::RunGoApp), не через launch_app",
             ))
         }
         other => return Err(format!("неизвестный тип входа: .{}", other)),

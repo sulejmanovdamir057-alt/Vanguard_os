@@ -110,6 +110,56 @@ pub struct DeviceView {
     pub drivers: Vec<VirtualDriver>,
 }
 
+/// Сетевой адаптер машины: поля `Get-NetAdapter` плюс сводка
+/// `Get-NetIPConfiguration` (ядро сливает их по имени интерфейса). Имена и
+/// статусы не интерпретируем — что вернула система, то и показываем.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetAdapter {
+    #[serde(default)]
+    pub name: String,
+    /// Up / Disconnected / Disabled — статус Get-NetAdapter как есть.
+    #[serde(default)]
+    pub status: String,
+    /// LinkSpeed: «1 Gbps», «100 Mbps» …
+    #[serde(default)]
+    pub speed: String,
+    /// InterfaceDescription — имя оборудования/драйвера.
+    #[serde(default)]
+    pub desc: String,
+    /// IPv4 через запятую (пусто, если адреса нет).
+    #[serde(default)]
+    pub ipv4: String,
+    /// Шлюз по умолчанию (IPv4).
+    #[serde(default)]
+    pub gw: String,
+    /// DNS-серверы IPv4 через запятую.
+    #[serde(default)]
+    pub dns: String,
+}
+
+/// Wi-Fi-сеть из `netsh wlan show networks`: SSID и сигнал.
+/// Разбор locale-устойчив: ключ «SSID» не переводится ни в одной локали, а
+/// сигнал узнаётся по значению с «%» (см. `bin/core.rs::parse_wifi`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetWifi {
+    /// Пустой — скрытая сеть, GUI показывает это честно.
+    pub ssid: String,
+    /// 0..=100; 0 и означает «строки сигнала не было».
+    #[serde(default)]
+    pub signal: u8,
+}
+
+/// Ответ на [`Request::NetStatus`]: адаптеры с адресами плюс Wi-Fi-эфир.
+/// `wifi_hw` — есть ли Wi-Fi-аппаратура вообще: без него пустой список
+/// ничего не значит (нет интерфейса или эфир пуст — разные состояния).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetView {
+    pub adapters: Vec<NetAdapter>,
+    pub wifi: Vec<NetWifi>,
+    #[serde(default)]
+    pub wifi_hw: bool,
+}
+
 /// Запрос к ядру. Одна строка JSON на соединение.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -134,6 +184,11 @@ pub enum Request {
     /// строкой, ошибка — хвост вывода компилятора. `dir` — папка приложения
     /// (`apps/<id>`, относительно общего CWD), `entry` — голый файл из манифеста.
     RunCsApp { dir: String, entry: String },
+    /// Go-вход приложения (`.go`): сборка `go build` в ядре и запуск
+    /// отдельным процессом — та же кухня, что `RunCsApp` (секунды → ядро,
+    /// клиент держит `bg_tasks`). Ответ — PID строкой, ошибка — хвост вывода
+    /// сборщика. `dir`/`entry` — те же правила, что у C#.
+    RunGoApp { dir: String, entry: String },
     /// Сохранить Python-код, присланный ИИ, в `vanguard_gen_<id>.py`.
     SaveScript {
         code: String,
@@ -156,6 +211,13 @@ pub enum Request {
     /// второй запрос не нужен, а сам опрос PnP берётся из кэша (аппаратура
     /// от переключения не меняется).
     SetDriver { id: String, enabled: bool },
+    // ── Сеть ──
+    /// Адаптеры с IP/шлюзом/DNS плюс Wi-Fi-эфир — **только чтение**
+    /// (`Get-NetAdapter` + `Get-NetIPConfiguration` + netsh в ядре). Ответ —
+    /// [`NetView`]; опрос дорог (PowerShell — секунды на холодную), поэтому
+    /// клиент шлёт его при первом открытии окна «Сеть» и по кнопке
+    /// «Обновить», а не каждый кадр.
+    NetStatus,
     // ── Запуски средствами Windows (C#-мост `tools/vlaunch.cs`) ──
     /// ShellExecute через хелпер `vlaunch`: `runas` — с повышением (придётся
     /// подтвердить UAC, ответ запроса ждёт — клиент держит `bg_tasks`),
