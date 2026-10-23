@@ -10,8 +10,11 @@ FastAPI на 127.0.0.1:8787: раздаёт фронтенд (TS -> browser/stat
 сайтов обходят нас стороной, а наружу стучимся только с 127.0.0.1.
 """
 import json
+import os
 import re
 import socket
+import subprocess
+import time
 import html as htmllib
 import urllib.parse
 import urllib.request
@@ -30,26 +33,83 @@ app = FastAPI(title="Vanguard Browser", version="0.1")
 
 
 # ── Мост к ядру (Rust): те же JSON-строки, что у оболочки ─────────────────
+def _spawn_core() -> bool:
+    """Поднимает ядро, если его никто не обслуживает — тот же контур, что у
+    ipc_client оболочки, но по физическим кандидатам (dev- или dist-раскладка).
+    Первый существующий бинарь, окно консоли не рисуем."""
+    root = BASE.parent
+    for rel in (
+        "target/debug/vanguard_core.exe",
+        "target/release/vanguard_core.exe",
+        "vanguard_core.exe",
+    ):
+        exe = root / rel
+        if not exe.is_file():
+            continue
+        kwargs: dict = {
+            "cwd": str(root),
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if os.name == "nt":
+            kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+        try:
+            subprocess.Popen([str(exe)], **kwargs)
+            return True
+        except OSError:
+            return False
+    return False
+
+
+def _wait_core(seconds: float = 3.0) -> None:
+    """Порт после спавна: ядро биндится почти сразу, но не мгновенно."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        try:
+            with socket.create_connection(CORE, timeout=0.2):
+                return
+        except OSError:
+            continue
+
+
 def core_call(payload: dict, timeout: float = 30.0) -> dict:
     """Один запрос к vanguard_core: строка JSON в TCP, ответ — до финального
-    kind (события Event идут перед ним, как в ipc_client)."""
-    with socket.create_connection(CORE, timeout=timeout) as s:
-        s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
-        buf = b""
-        while True:
-            chunk = s.recv(65536)
-            if not chunk:
-                raise RuntimeError("ядро закрыло соединение")
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                if not line.strip():
-                    continue
-                resp = json.loads(line.decode("utf-8"))
-                if resp.get("kind") in ("ok", "err"):
-                    if resp["kind"] == "err":
-                        raise HTTPException(502, resp.get("text", "ошибка ядра"))
-                    return resp
+    kind (события Event идут перед ним, как в ipc_client). Свежий запуск —
+    ядро ещё не поднято: браузер поднимает его сам. Любая ошибка уходит
+    HTTPException, то есть всегда JSON {detail} — плоский 500 фронтенд не
+    распарсит («not valid JSON»)."""
+    try:
+        s = socket.create_connection(CORE, timeout=5.0)
+    except OSError:
+        _spawn_core()
+        _wait_core()
+        try:
+            s = socket.create_connection(CORE, timeout=5.0)
+        except OSError as e:
+            raise HTTPException(503, f"ядро недоступно на 127.0.0.1:7331: {e}")
+    with s:
+        s.settimeout(timeout)
+        try:
+            s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            buf = b""
+            while True:
+                chunk = s.recv(65536)
+                if not chunk:
+                    raise HTTPException(502, "ядро закрыло соединение")
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    resp = json.loads(line.decode("utf-8"))
+                    if resp.get("kind") in ("ok", "err"):
+                        if resp["kind"] == "err":
+                            raise HTTPException(502, resp.get("text", "ошибка ядра"))
+                        return resp
+        except OSError as e:
+            raise HTTPException(502, f"сбой обмена с ядром: {e}")
 
 
 class ShellIn(BaseModel):
@@ -129,14 +189,48 @@ def extract(url: str, page: str) -> dict:
     }
 
 
+def normalize_url(url: str) -> str:
+    """HTTP-клиенты Python кодируют URL латиницей: кириллический домен роняет
+    запрос ещё до DNS ('latin-1' codec can't encode…). Домен → punycode (idna),
+    путь/запрос/якорь → percent-encoding; уже закодированные %XX не трогаем
+    (`%` в safe-списках)."""
+    sp = urllib.parse.urlsplit(url)
+    host = sp.hostname or ""
+    if host and not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            host = urllib.parse.quote(host, safe="")
+        try:
+            port = sp.port
+        except ValueError:
+            port = None
+        netloc = f"[{host}]" if ":" in host else host
+        if port is not None:
+            netloc += f":{port}"
+        sp = urllib.parse.urlsplit(
+            urllib.parse.urlunsplit((sp.scheme, netloc, sp.path, sp.query, sp.fragment))
+        )
+    return urllib.parse.urlunsplit(
+        (
+            sp.scheme,
+            sp.netloc,
+            urllib.parse.quote(sp.path, safe="/%:@!$&'()*+,;=-._~"),
+            urllib.parse.quote(sp.query, safe="&=%/:;+,$@!?'()*~-._"),
+            urllib.parse.quote(sp.fragment, safe="&=%/:;+,$@!?'()*~-._"),
+        )
+    )
+
+
 @app.post("/api/proxy")
 def proxy(body: UrlIn):
     """Загрузка страницы сервером: http/https, лимит 2 МБ и 15 с."""
     url = body.url.strip()
     if "://" not in url:
         url = "https://" + url
-    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
         raise HTTPException(400, "только http/https")
+    url = normalize_url(url)
     req = urllib.request.Request(url, headers={"User-Agent": "VanguardBrowser/0.1"})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:

@@ -30,6 +30,17 @@ const status = (msg: string, bad = false) => {
   s.classList.toggle("bad", bad);
 };
 
+// Ошибка API: у HTTPException тело JSON {detail}, у необработанного 500 —
+// плоский текст; падение r.json() на нём как раз и даёт «not valid JSON».
+async function errOf(r: Response): Promise<string> {
+  try {
+    const j = await r.json() as { detail?: string };
+    return j.detail ?? `${r.status} ${r.statusText}`;
+  } catch {
+    return `${r.status} ${r.statusText}`;
+  }
+}
+
 // ── История вкладки «Страница» ───────────────────────────────────────────
 const history: string[] = [];
 let hpos = -1;
@@ -48,7 +59,7 @@ async function navigate(url: string, push = true): Promise<void> {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url }),
     });
-    if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
+    if (!r.ok) throw new Error(await errOf(r));
     renderPage(await r.json() as PageReply);
     status("Готово: " + url);
   } catch (e) {
@@ -88,14 +99,14 @@ async function loadSystem(): Promise<void> {
   $("sys-status").textContent = "Опрос ядра…";
   const one = async (path: string): Promise<string> => {
     const r = await fetch(path);
-    if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
+    if (!r.ok) throw new Error(await errOf(r));
     return await r.text();
   };
   try {
     // Устройства — медленный опрос PowerShell в ядре, грузим отдельно от
     // быстрых эндпоинтов, чтобы медленный не держал остальные.
     void fetch("/api/os/devices").then(async (r) => {
-      if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
+      if (!r.ok) throw new Error(await errOf(r));
       renderDevices(await r.json() as DeviceView);
     }).catch((e) => { $("sys-status").textContent = "Устройства: " + e.message; });
 
@@ -148,7 +159,7 @@ async function toggleDriver(dr: VirtualDriver, btn: HTMLButtonElement): Promise<
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: dr.id, enabled: !dr.enabled }),
     });
-    if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
+    if (!r.ok) throw new Error(await errOf(r));
     renderDevices(await r.json() as DeviceView);
   } catch (e) {
     $("sys-status").textContent = "Драйвер: " + (e as Error).message;

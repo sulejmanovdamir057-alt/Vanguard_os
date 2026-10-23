@@ -12,6 +12,14 @@
     s.textContent = msg;
     s.classList.toggle("bad", bad);
   };
+  async function errOf(r) {
+    try {
+      const j = await r.json();
+      return j.detail ?? `${r.status} ${r.statusText}`;
+    } catch {
+      return `${r.status} ${r.statusText}`;
+    }
+  }
   var history = [];
   var hpos = -1;
   async function navigate(url, push = true) {
@@ -28,7 +36,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url })
       });
-      if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
+      if (!r.ok) throw new Error(await errOf(r));
       renderPage(await r.json());
       status("\u0413\u043E\u0442\u043E\u0432\u043E: " + url);
     } catch (e) {
@@ -72,12 +80,12 @@
     $("sys-status").textContent = "\u041E\u043F\u0440\u043E\u0441 \u044F\u0434\u0440\u0430\u2026";
     const one = async (path) => {
       const r = await fetch(path);
-      if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
+      if (!r.ok) throw new Error(await errOf(r));
       return await r.text();
     };
     try {
       void fetch("/api/os/devices").then(async (r) => {
-        if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
+        if (!r.ok) throw new Error(await errOf(r));
         renderDevices(await r.json());
       }).catch((e) => {
         $("sys-status").textContent = "\u0423\u0441\u0442\u0440\u043E\u0439\u0441\u0442\u0432\u0430: " + e.message;
@@ -132,7 +140,7 @@
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id: dr.id, enabled: !dr.enabled })
       });
-      if (!r.ok) throw new Error((await r.json()).detail ?? r.statusText);
+      if (!r.ok) throw new Error(await errOf(r));
       renderDevices(await r.json());
     } catch (e) {
       $("sys-status").textContent = "\u0414\u0440\u0430\u0439\u0432\u0435\u0440: " + e.message;
