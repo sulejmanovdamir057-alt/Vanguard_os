@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use vanguard_os_lib::core::executor::VanguardExecutor;
+use vanguard_os_lib::core::launcher;
 use vanguard_os_lib::core::shell::VanguardShell;
 use vanguard_os_lib::core::telemetry::{spawn_telemetry_daemon, SystemMetrics};
 use vanguard_os_lib::ipc::{self, DeviceEntry, DeviceView, Event, FsEntry, FsFile, FsListing, Request, Response, VirtualDriver};
@@ -148,10 +149,18 @@ fn handle_client(
                 let out = vanguard_os_lib::core::shell::count_dialogue_lines();
                 send(&mut writer, &Response::ok(out.to_string()));
             }
+            // ── C#-приложения: компиляция (csc/dotnet) и запуск отдельным процессом ──
+            Request::RunCsApp { dir, entry } => {
+                send(&mut writer, &run_cs_app(&dir, &entry));
+            }
             // ── Диспетчер устройств: только чтение, опрос через PowerShell ──
             Request::HwDevices => send(&mut writer, &hw_devices()),
             Request::SetDriver { id, enabled } => {
                 send(&mut writer, &set_driver(&id, enabled))
+            }
+            // ── Запуски средствами Windows: C#-мост ShellExecute ──
+            Request::ShellExec { mode, target } => {
+                send(&mut writer, &shell_exec(&mode, &target));
             }
             // ── Проводник «Файлы»: пути абсолютные, песочницы больше нет ──
             Request::FsList { path } => send(&mut writer, &fs_list(&path)),
@@ -183,6 +192,9 @@ fn dispatch_shell(shell: &mut VanguardShell, query: &str) -> Response {
         // что клиенту возвращаем маркеры, а разбор — на его стороне.
         ShellAction::ClearChat => Response::ok("<< CLEAR_CHAT >>"),
         ShellAction::OpenPath(target) => Response::ok(format!("<< OPEN_PATH: {} >>", target)),
+        // `runas` дошёл до ядра — значит, запрос шла по IPC напрямую (`Request::Shell`).
+        // Выполняем здесь же: мост запуска живёт в ядре, второй обход не нужен.
+        ShellAction::Elevate(target) => shell_exec("runas", &target),
     }
 }
 
@@ -393,6 +405,160 @@ fn list_scripts() -> String {
 /// Лимит на открываемый файл. Оболочка держит текст в памяти и рисует его
 /// каждый кадр — лог в сотню мегабайтов положил бы рендер.
 const FS_VIEW_LIMIT: u64 = 1_048_576;
+
+// ─── C#-приложения и C#-мост запуска ────────────────────────────────────────
+
+/// ShellExecute через C#-мост (`core::launcher`): белый список режимов — сам
+/// хелпер доверяет `args[0]` не больше, чем мы. Ответ — строка хелпера
+/// (`pid=…`) либо хвост ошибки; сборка хелпера (csc, ~0.6 с) тоже здесь.
+fn shell_exec(mode: &str, target: &str) -> Response {
+    const MODES: [&str; 4] = ["runas", "aumid", "clsid", "shell"];
+    if !MODES.contains(&mode) {
+        return Response::err(format!("vlaunch: неизвестный режим «{}»", mode));
+    }
+    match launcher::run(&[mode, target]) {
+        Ok(t) => Response::ok(t),
+        Err(e) => Response::err(e),
+    }
+}
+
+/// C#-приложение: компиляция и запуск отдельным процессом. Секунды (dotnet
+/// build) — поэтому запросом в ядро, а не вызовом GUI; клиент держит `bg_tasks`.
+/// Ответ — PID строкой, ошибка — хвост вывода компилятора.
+fn run_cs_app(dir: &str, entry: &str) -> Response {
+    match cs_build_and_run(dir, entry) {
+        Ok(pid) => Response::ok(pid),
+        Err(e) => Response::err(e),
+    }
+}
+
+/// Собственно компиляция + старт. `dir` приходит относительным (`apps/<id>`):
+/// ядро и оболочка делят CWD (правило раздела о runtime side effects), поэтому
+/// резолвим от текущего каталога ядра. `..` и байты NUL отсекаем текстом до
+/// любых проверок на диске; `entry` — только голый файл, как в манифесте.
+fn cs_build_and_run(dir: &str, entry: &str) -> Result<String, String> {
+    if dir.contains("..") || dir.contains('\0') {
+        return Err(String::from("кривая директория приложения"));
+    }
+    if entry.contains("..") || entry.contains('/') || entry.contains('\\') || entry.contains('\0') {
+        return Err(String::from("кривой файл входа: нужен голый файл вроде main.cs"));
+    }
+    // csc режет аргументы по `/` (проверено: `tools/vlaunch.cs` он читает как
+    // опцию) — приводим слэши к windows-виду до того, как путь уйдёт в компилятор.
+    let dir = dir.replace('/', "\\");
+    let root = if Path::new(&dir).is_absolute() {
+        PathBuf::from(dir)
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("не удалось прочитать CWD: {}", e))?
+            .join(dir)
+    };
+    if !root.is_dir() {
+        return Err(format!("нет папки приложения {}", root.display()));
+    }
+    let src = root.join(entry);
+    if !src.is_file() {
+        return Err(format!("нет файла входа {}", src.display()));
+    }
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let exe = match ext.as_str() {
+        "cs" => csc_build(&src)?,
+        "csproj" => dotnet_build(&root, &src)?,
+        other => return Err(format!("не C#-вход: .{}", other)),
+    };
+    // Старт — та же политика, что у apps::launch_app: отдельный процесс, потоки
+    // не перехватываем; консольному приложению оболочка без консоли выделит свою.
+    let child = std::process::Command::new(&exe)
+        .current_dir(&root)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("не удалось запустить {}: {}", exe.display(), e))?;
+    Ok(child.id().to_string())
+}
+
+/// Одиночный `.cs` → exe через csc.exe .NET Framework — он входит в каждую
+/// Windows, SDK и NuGet не нужны; сам компилятор — C# 5, исходники под него.
+/// `/codepage:65001` обязателен: без BOM UTF-8 читается как cp1251 (та же
+/// ловушка, что у `.ps1` в PS 5.1). Флаг цели подбираем по исходнику: WinForms
+/// под `winexe`, иначе рядом с окном открылась бы пустая консоль.
+fn csc_build(src: &Path) -> Result<PathBuf, String> {
+    const CANDIDATES: [&str; 2] = [
+        r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+        r"C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe",
+    ];
+    let csc = CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|p| p.is_file())
+        .ok_or_else(|| {
+            String::from("csc.exe не найден — нужен .NET Framework (входит в Windows)")
+        })?;
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
+    let parent = src
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("app");
+    // Результат — в %TEMP%, а не рядом с исходником: папка store/ под git,
+    // и мусор там остался бы виден в git status.
+    let out = std::env::temp_dir().join(format!("vanguard_cs_{}_{}.exe", parent, stem));
+    let text = std::fs::read_to_string(src).unwrap_or_default();
+    let target = if text.contains("System.Windows.Forms") {
+        "winexe"
+    } else {
+        "exe"
+    };
+    let out_arg = format!("/out:{}", out.display());
+    let res = std::process::Command::new(csc)
+        .args(["/nologo", "/codepage:65001", "/optimize+"])
+        .arg(format!("/target:{}", target))
+        .arg(out_arg)
+        .args(["/r:System.Windows.Forms.dll", "/r:System.Drawing.dll"])
+        .arg(src)
+        .output()
+        .map_err(|e| format!("csc не запустился: {}", e))?;
+    if !res.status.success() {
+        return Err(launcher::output_tail(&res.stdout, &res.stderr));
+    }
+    Ok(out)
+}
+
+/// `.csproj` → `dotnet build -c Release` (нужен установленный .NET SDK; без
+/// пакетов проект собирается и без сети) → exe под `bin/Release/<TFM>/`.
+fn dotnet_build(root: &Path, proj: &Path) -> Result<PathBuf, String> {
+    let res = std::process::Command::new("dotnet")
+        .arg("build")
+        .arg(proj)
+        .args(["-c", "Release", "--nologo", "-v", "q"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("dotnet не запустился (нужен .NET SDK): {}", e))?;
+    if !res.status.success() {
+        return Err(launcher::output_tail(&res.stdout, &res.stderr));
+    }
+    let stem = proj.file_stem().and_then(|s| s.to_str()).unwrap_or("app");
+    // TFM-папка одна уровень (net10.0-windows/…); имя exe = имя проекта.
+    let pattern = root
+        .join("bin")
+        .join("Release")
+        .join("*")
+        .join(format!("{}.exe", stem));
+    let pattern = pattern.to_string_lossy().replace('\\', "/");
+    let mut found: Vec<PathBuf> = glob::glob(&pattern)
+        .map_err(|e| format!("кривой glob: {}", e))?
+        .filter_map(|p| p.ok())
+        .collect();
+    found.sort();
+    found
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("сборка прошла, но exe не найден: {}", pattern))
+}
 
 /// Резолвит абсолютный путь запроса в канонический.
 ///

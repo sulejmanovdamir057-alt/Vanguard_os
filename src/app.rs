@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender}; // Объединенный импорт каналов
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -110,6 +110,83 @@ fn browser_open_system() -> String {
         Ok(()) => format!("Браузер: открыт {}\n", BROWSER_URL),
         Err(e) => format!("Браузер: {}\n", e),
     }
+}
+
+/// Чем закончился запуск приложения: мгновенный PID либо фоновая C#-сборка в
+/// ядре — её итог придёт токеном в чат, как у `/run`.
+enum AppLaunch {
+    Pid(u32),
+    Pending,
+}
+
+/// Один IPC-запрос в ядро: сериализация + `ipc_client::call`. Текст `Ok`
+/// возвращается как есть, `Err` — уже обрезанный (без переводов строки).
+fn core_call(req: &Request) -> Result<String, String> {
+    let json = serde_json::to_string(req).map_err(|e| format!("сериализация: {}", e))?;
+    let reply = crate::ipc_client::call(&json);
+    if reply.ok {
+        Ok(reply.text)
+    } else {
+        Err(reply.text.trim().to_string())
+    }
+}
+
+/// Итог фоновой задачи в чат: канал шелла, иначе stdout — тот же фолбэк, что
+/// в `shell.rs`. Писать из потока в `ai_text_area` нельзя, канал — единственный
+/// безопасный путь.
+fn bg_report(log_tx: &Option<Sender<AiEvent>>, line: String) {
+    match log_tx {
+        Some(tx) => {
+            let _ = tx.send(AiEvent::Token(line));
+        }
+        None => println!("{}", line),
+    }
+}
+
+/// Относительная цель терминала — от текущего каталога (`term_cwd`); URL и
+/// абсолютные пути уходят как есть. Выделено из `open_target`, чтобы тем же
+/// разбором пользовался `runas`.
+fn resolve_term(cwd: &str, target: &str) -> String {
+    let p = std::path::Path::new(target);
+    if target.contains("://") || p.is_absolute() || cwd.is_empty() {
+        target.to_string()
+    } else {
+        format!("{}\\{}", cwd, target)
+    }
+}
+
+/// Общий запускатель всех трёх точек («Пуск»/«Все приложения», окно «Приложения»,
+/// терминальный `start`). Свободная функция, а не метод — тот же приём, что
+/// `walk_history` и `fs_*`: окно «Приложения» зовёт её **изнутри замыкания**,
+/// где по методу потребовался бы весь `&mut self` вместе с уже занятым
+/// `self.windows.apps`; здесь заимствуются только поля. Строка «сборка в ядре…»
+/// пишется в чат сразу, итог — токеном из потока.
+fn launch_app_soft(
+    chat: &mut String,
+    bg: &Arc<AtomicUsize>,
+    log_tx: &Option<Sender<AiEvent>>,
+    app: &apps::AppInfo,
+) -> Result<AppLaunch, String> {
+    if !apps::is_cs(&app.manifest.entry) {
+        return apps::launch_app(app).map(AppLaunch::Pid);
+    }
+    // C#: компиляция (csc ~0.6 с / dotnet — секунды) — в ядре и в фоне, кадр не держим.
+    chat.push_str(&format!(">> C#: «{}» — сборка в ядре…\n", app.manifest.name));
+    bg.fetch_add(1, Ordering::SeqCst);
+    let dir = app.dir.to_string_lossy().into_owned();
+    let entry = app.manifest.entry.clone();
+    let name = app.manifest.name.clone();
+    let tx = log_tx.clone();
+    let own_bg = Arc::clone(bg);
+    std::thread::spawn(move || {
+        let line = match core_call(&Request::RunCsApp { dir, entry }) {
+            Ok(pid) => format!("▶ Запущено: {} (PID {})\n", name, pid.trim()),
+            Err(e) => format!(">> C# FAILED: {}\n", e),
+        };
+        bg_report(&tx, line);
+        own_bg.fetch_sub(1, Ordering::SeqCst);
+    });
+    Ok(AppLaunch::Pending)
 }
 
 /// Реестр сгенерированных скриптов, свежие сверху — раздел «Рекомендуется»
@@ -731,7 +808,7 @@ impl VanguardOSApp {
             // «Все приложения» → запуск отдельным процессом; ошибка — в чат,
             // успех — тостом (окно Лаунчера в этот момент может быть закрыто).
             DesktopIntent::LaunchApp(id) => match self.launch_installed_app(&id) {
-                Ok((name, pid)) => self.toast(format!("▶ Запущено: {} (PID {})", name, pid)),
+                Ok(msg) => self.toast(msg),
                 Err(e) => self
                     .ai_text_area
                     .push_str(&format!(">> LAUNCH FAILED: {}\n", e)),
@@ -842,32 +919,47 @@ impl VanguardOSApp {
             // Терминальный `cls`: тот же путь, что Ctrl+L и пункт меню стола.
             ShellAction::ClearChat => self.clear_chat(),
             ShellAction::OpenPath(target) => self.open_target(&target),
+            ShellAction::Elevate(target) => self.elevate_target(&target),
             ShellAction::AiStreamAllowed => {}
         }
     }
 
     /// `start <цель>`: установленное приложение (по id или имени) запускаем,
+    /// системные приложения Windows — через C#-мост (`start aumid:`/`start clsid:`),
     /// URL/путь открываем средствами системы — относительный путь берём от
     /// текущего каталога терминала.
     fn open_target(&mut self, target: &str) {
+        if let Some(id) = target.strip_prefix("aumid:") {
+            self.shell_exec_bg("aumid", id.to_string());
+            return;
+        }
+        if let Some(guid) = target.strip_prefix("clsid:") {
+            self.shell_exec_bg("clsid", guid.to_string());
+            return;
+        }
         if let Some(app) = apps::scan_apps("apps").into_iter().find(|a| {
             a.manifest.id.eq_ignore_ascii_case(target)
                 || a.manifest.name.eq_ignore_ascii_case(target)
         }) {
-            let msg = match apps::launch_app(&app) {
-                Ok(pid) => format!(">> STARTED: {} (PID {})\n", app.manifest.name, pid),
+            let msg = match launch_app_soft(
+                &mut self.ai_text_area,
+                &self.shell.bg_tasks,
+                &self.shell.log_tx,
+                &app,
+            ) {
+                Ok(AppLaunch::Pid(pid)) => {
+                    format!(">> STARTED: {} (PID {})\n", app.manifest.name, pid)
+                }
+                // Строка «сборка в ядре…» уже в чате — вторую не пишем.
+                Ok(AppLaunch::Pending) => String::new(),
                 Err(e) => format!(">> START FAILED: {}\n", e),
             };
-            self.ai_text_area.push_str(&msg);
+            if !msg.is_empty() {
+                self.ai_text_area.push_str(&msg);
+            }
             return;
         }
-        let p = std::path::Path::new(target);
-        let resolved =
-            if target.contains("://") || p.is_absolute() || self.shell.term_cwd.is_empty() {
-                target.to_string()
-            } else {
-                format!("{}\\{}", self.shell.term_cwd, target)
-            };
+        let resolved = resolve_term(&self.shell.term_cwd, target);
         let msg = match sys_open(&resolved) {
             Ok(()) => format!(">> STARTED: {}\n", resolved),
             Err(e) => format!(">> START FAILED: {}\n", e),
@@ -875,15 +967,59 @@ impl VanguardOSApp {
         self.ai_text_area.push_str(&msg);
     }
 
+    /// `runas <цель>`: путь уходит в C#-мост с повышением — UAC придётся
+    /// подтвердить, поэтому IPC в фоне (bg_tasks + токен в чат).
+    fn elevate_target(&mut self, target: &str) {
+        let resolved = resolve_term(&self.shell.term_cwd, target);
+        if !resolved.contains("://") && !std::path::Path::new(&resolved).exists() {
+            self.ai_text_area
+                .push_str(&format!(">> RUNAS FAILED: нет такого файла: {}\n", resolved));
+            return;
+        }
+        self.shell_exec_bg("runas", resolved);
+    }
+
+    /// Фоновый запрос C#-моста через ядро: кадр не держим — сборка хелпера ~0.6 с,
+    /// а на `runas` ответ ждёт пользователя в UAC-диалоге сколько угодно.
+    fn shell_exec_bg(&mut self, mode: &str, target: String) {
+        let lead = match mode {
+            "runas" => format!(">> UAC: {} — жду подтверждения…\n", target),
+            _ => format!(">> START: {} — C#-мост в ядре…\n", target),
+        };
+        self.ai_text_area.push_str(&lead);
+        self.shell.bg_tasks.fetch_add(1, Ordering::SeqCst);
+        let log_tx = self.shell.log_tx.clone();
+        let bg = Arc::clone(&self.shell.bg_tasks);
+        // Потоку нужен 'static — &str из параметра не годится, копируем сразу.
+        let mode = mode.to_string();
+        std::thread::spawn(move || {
+            let line = match core_call(&Request::ShellExec { mode, target }) {
+                Ok(t) => format!("✓ vlaunch: {}\n", t.trim()),
+                Err(e) => format!(">> VLAUNCH FAILED: {}\n", e),
+            };
+            bg_report(&log_tx, line);
+            bg.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+
     /// Запуск установленного приложения по id — общий путь и для «Пуска», и для
-    /// Лаунчера. Отдаёт (имя, PID): имя нужно, чтобы подписать тост.
-    fn launch_installed_app(&mut self, id: &str) -> Result<(String, u32), String> {
+    /// Лаунчера. Возвращает готовое сообщение для тоста: PID сразу либо строку
+    /// «собираю» для C# (её итог придёт токеном в чат).
+    fn launch_installed_app(&mut self, id: &str) -> Result<String, String> {
         let app = apps::scan_apps("apps")
             .into_iter()
             .find(|a| a.manifest.id == id)
             .ok_or_else(|| format!("приложение «{}» не установлено", id))?;
         let name = app.manifest.name.clone();
-        apps::launch_app(&app).map(|pid| (name, pid))
+        match launch_app_soft(
+            &mut self.ai_text_area,
+            &self.shell.bg_tasks,
+            &self.shell.log_tx,
+            &app,
+        )? {
+            AppLaunch::Pid(pid) => Ok(format!("▶ Запущено: {} (PID {})", name, pid)),
+            AppLaunch::Pending => Ok(format!("▶ Собираю: {} — статус придёт в чат", name)),
+        }
     }
 
     /// Браузер (стадия 1): поднимаем локальный FastAPI-сервер, если его ещё нет,
@@ -1873,8 +2009,18 @@ impl VanguardOSApp {
                             .iter()
                             .find(|a| Some(a.manifest.id.as_str()) == sel.as_deref())
                         {
-                            self.apps_status = match apps::launch_app(a) {
-                                Ok(pid) => format!("▶ Запущено: {} (PID {})", a.manifest.name, pid),
+                            self.apps_status = match launch_app_soft(
+                                &mut self.ai_text_area,
+                                &self.shell.bg_tasks,
+                                &self.shell.log_tx,
+                                a,
+                            ) {
+                                Ok(AppLaunch::Pid(pid)) => {
+                                    format!("▶ Запущено: {} (PID {})", a.manifest.name, pid)
+                                }
+                                Ok(AppLaunch::Pending) => {
+                                    format!("C#: сборка «{}» — статус в чате", a.manifest.name)
+                                }
                                 Err(e) => format!("Ошибка запуска: {}", e),
                             };
                         }

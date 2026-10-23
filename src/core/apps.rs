@@ -13,7 +13,8 @@ use serde::Deserialize;
 pub struct AppManifest {
     pub id: String,
     pub name: String,
-    /// Файл входа относительно папки приложения: main.py / app.exe / run.bat.
+    /// Файл входа относительно папки приложения: main.py / app.exe / run.bat
+    /// / main.cs / app.csproj — по расширению выбирается способ запуска.
     pub entry: String,
     /// Глиф для списков: только символы Segoe UI Symbol (эмодзи = квадраты).
     #[serde(default)]
@@ -48,6 +49,16 @@ pub fn scan_apps(dir: &str) -> Vec<AppInfo> {
     }
     out.sort_by_key(|a| a.manifest.name.to_lowercase());
     out
+}
+
+/// C#-вход (`.cs`/`.csproj`): компиляция — тяжёлый отдельный путь через ядро
+/// (`Request::RunCsApp`), поэтому [`launch_app`] такое приложение запустить не
+/// может — оболочка проверяет это первым делом.
+pub fn is_cs(entry: &str) -> bool {
+    matches!(
+        entry.to_ascii_lowercase().rsplit_once('.').map(|(_, e)| e),
+        Some("cs" | "csproj")
+    )
 }
 
 /// Идентификатор должен быть именем папки, а не путём: без этого install/uninstall
@@ -132,6 +143,13 @@ pub fn launch_app(app: &AppInfo) -> Result<u32, String> {
             c
         }
         "exe" => Command::new(&entry),
+        // Defensive: вызывающие проверяют is_cs() первым делом, но если дошло
+        // сюда — это не «неизвестный формат», а путь, который ядро умеет сам.
+        other if is_cs(other) => {
+            return Err(String::from(
+                "C#-вход: компиляция идёт в ядре (Request::RunCsApp), не через launch_app",
+            ))
+        }
         other => return Err(format!("неизвестный тип входа: .{}", other)),
     };
     let child = cmd

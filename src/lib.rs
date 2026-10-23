@@ -26,4 +26,6 @@ pub mod core {
     pub mod executor;
     pub mod telemetry;
     pub mod apps;
+    /// C#-мост запуска (`vlaunch`): собирается csc на месте, зовётся ядром.
+    pub mod launcher;
 }

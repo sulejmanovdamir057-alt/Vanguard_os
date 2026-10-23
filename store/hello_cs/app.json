@@ -1,0 +1,8 @@
+{
+  "id": "hello_cs",
+  "name": "Привет из C#",
+  "entry": "main.cs",
+  "icon": "▣",
+  "version": "1.0",
+  "desc": "Настоящее окно WinForms: ядро компилирует main.cs через csc при первом запуске"
+}

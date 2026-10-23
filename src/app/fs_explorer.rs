@@ -149,6 +149,9 @@ enum FsKind {
     /// Остальные мутации: при успехе перечитать каталог. `clear_sel` — после
     /// переименования/удаления, у созданий выделение трогать не нужно.
     Mutating { clear_sel: bool },
+    /// `ShellExec` (запуск от администратора): текст результата — в статус,
+    /// каталог перечитывать не нужно, список не менялся.
+    Status,
 }
 
 /// Итог одной задачи: уже разобранный JSON плюс метка, что с ним делать.
@@ -157,6 +160,7 @@ enum FsReply {
     Read(Result<FsFile, String>),
     Written { path: String, result: Result<String, String> },
     Mutated { clear_sel: bool, result: Result<String, String> },
+    Status(Result<String, String>),
 }
 
 /// Превращает текст `Ok` в структуру. Ошибка формата сходится с ошибкой ядра
@@ -201,6 +205,7 @@ fn fs_spawn(fs: &mut FsExplorer, req: Request, kind: FsKind) -> bool {
             FsKind::Reading => FsReply::Read(payload.and_then(|t| parse_json(&t))),
             FsKind::Writing(path) => FsReply::Written { path, result: payload },
             FsKind::Mutating { clear_sel } => FsReply::Mutated { clear_sel, result: payload },
+            FsKind::Status => FsReply::Status(payload),
         });
         // fetch_sub намеренно не здесь — иначе счётчик упал бы раньше, чем
         // fs_drain прочитает ответ, и egui уснул бы с непрочитанным результатом.
@@ -266,6 +271,14 @@ fn fs_apply_reply(fs: &mut FsExplorer, reply: FsReply) {
                 }
                 let path = fs.path.clone();
                 fs_spawn(fs, Request::FsList { path }, FsKind::Listing);
+            }
+            Err(e) => fs_fail(fs, e),
+        },
+        // Запуск от администратора: строка хелпера («pid=…») — прямо в статус.
+        FsReply::Status(res) => match res {
+            Ok(t) => {
+                fs.status = format!("Запущено от администратора: {}", t);
+                fs.failed = false;
             }
             Err(e) => fs_fail(fs, e),
         },
@@ -668,6 +681,35 @@ fn fs_row_actions(ui: &mut egui::Ui, fs: &mut FsExplorer) {
                             FsKind::Mutating { clear_sel: true },
                         );
                     }
+                }
+            }
+            // Запуск от имени администратора — то же, что «ПКМ → Запуск от имени
+            // администратора» в Windows: C#-мост (vlaunch runas) шлёт ShellExecute
+            // с verb'ом runas, UAC-диалог системы подтверждает сам пользователь.
+            // Показываем только для запускаемых расширений и только когда выделен
+            // файл; ответ запроса ждёт, пока UAC не закроется.
+            let exec_ext = sel_name
+                .as_deref()
+                .and_then(|n| n.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()))
+                .unwrap_or_default();
+            let can_admin = has_sel
+                && !fs.busy
+                && ["exe", "bat", "cmd", "ps1", "py"].contains(&exec_ext.as_str());
+            if ui
+                .add_enabled(can_admin, egui::Button::new("▲ Админ"))
+                .on_hover_text("Запуск от имени администратора (UAC)")
+                .clicked()
+            {
+                if let Some(name) = sel_name.clone() {
+                    let path = fs_join(&fs.path, &name);
+                    fs_spawn(
+                        fs,
+                        Request::ShellExec {
+                            mode: String::from("runas"),
+                            target: path,
+                        },
+                        FsKind::Status,
+                    );
                 }
             }
             // Спросить ИИ — вопрос про то, на что смотрит человек: выделенное

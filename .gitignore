@@ -1,5 +1,9 @@
 /target
 
+# C#-мост запуска (tools/vlaunch.cs): собирается csc при первом runas/aumid/clsid —
+# локальный артефакт, как vanguard_app_*.
+vanguard_launch.exe
+
 # Артефакты, которые приложение пишет в корень репозитория при работе
 # (см. раздел про runtime side effects в AGENTS.md). Ни один из них не является
 # исходником: скрипты генерирует ИИ, .exe/.pdb — rustc, .rs/.bat/.sh — временные.

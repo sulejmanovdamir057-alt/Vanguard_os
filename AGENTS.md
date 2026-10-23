@@ -283,6 +283,11 @@ Layout follows the process split — engine in the lib, GUI in the shell binary:
 - `src/core/apps.rs` — installed-app registry: `AppManifest`, `scan_apps`/`install_app`/
   `uninstall_app`/`launch_app` over `apps/<id>/` (`store/` is the tracked catalogue) — see
   the "Windows-like surface" section below.
+- `src/core/launcher.rs` — C#-мост запуска `vlaunch`: собирает `tools/vlaunch.cs` csc'ом в
+  `vanguard_launch.exe` (пересборка по mtime исходника) и шлёт ShellExecute — `runas`
+  (UAC)/`aumid`/`clsid`/`shell`. Зовётся ядром для `Request::ShellExec`; вызывающий держит
+  `bg_tasks`, потому что на `runas` ответ ждёт пользователя в UAC-диалоге. Три палки —
+  в разделе «C#-приложения и C#-мост запуска» ниже.
 - `src/core/telemetry.rs` — background thread sampling CPU/RAM/disk into
   `Arc<Mutex<SystemMetrics>>` every 500 ms; the UI reads that guard, never calls sysinfo
   directly. Each process spawns its own daemon — the core's is for `/hardware`, the shell's
@@ -511,13 +516,16 @@ Generated artifacts, all relative to the *core's* CWD: `vanguard_gen_<id>.py`,
 
 `.gitignore` covers all of the above (`vanguard_gen_*`, `vanguard_app_*`, `vanguard_script_*`,
 `vanguard_tmp_*`, `vanguard_notes.txt`, `*.rs.bak`, `/apps/` — installed apps are copies of
-`store/` and stay local), so a clean checkout stays clean. The older note that
+`store/` and stay local — и `vanguard_launch.exe`, который собирает C#-мост запуска), so a
+clean checkout stays clean. The older note that
 "`.gitignore` contains only `/target`" is long obsolete — do not trust it.
 
 External tool requirements for those paths: `python` on PATH for `/run`, `rustc` on PATH for
 AI-generated Rust (the **core** compiles with `rustc -O` — see `src/bin/core.rs::compile_rust`;
 the shell's local `execute_ai_action` still has a `rustc` branch as a fallback when the core is
-down, and both must stay in sync if you change compile flags).
+down, and both must stay in sync if you change compile flags). C#: `csc.exe` .NET Framework —
+входит в каждую Windows, ни SDK, ни NuGet не нужны (и хелпер `vlaunch`, и `.cs`-входы); вход
+`.csproj` дополнительно требует `dotnet` SDK в PATH (здесь стоит 10.0.302).
 
 Slash-commands: `/help /apps /run <id> /hardware /wipe /reset /exit`. A message whose **first
 word** is a bare terminal command (`help ? dir ls cd type cat cls clear echo start ipconfig
@@ -614,15 +622,76 @@ tier owns `VanguardShell::term_cwd` (per-shell string, `~` when unset) and `term
 |---|---|---|
 | manifest | `apps/<id>/app.json` | `AppManifest { id, name, entry, icon, version, desc }` — installed-state lives in the same file |
 | catalogue | `store/<id>/` (tracked) | install = recursive `copy_dir` store→apps; occupied target **refused**; uninstall = `remove_dir_all`, two-click GUI confirm |
-| launch | `apps::launch_app` | entry by extension (py/bat/cmd/ps1/exe), detached spawn, returns the PID for the toast |
+| launch | `apps::launch_app` | entry by extension (py/bat/cmd/ps1/exe), detached spawn, returns the PID for the toast; `.cs`/`.csproj` сюда не входят — их компиляция идёт в ядре, см. ниже |
 | guard | `apps::check_id` | rejects `..`/separators/drive-colon — a manifest id becomes a path component |
 
-`apps/` is git-ignored: a fresh checkout shows «Установленные (0)» and the two samples in
-«Магазин» (`store/hello`, `store/clock` — Tkinter, so `python` must be on PATH). Everything
+`apps/` is git-ignored: a fresh checkout shows «Установленные (0)» and the three samples in
+«Магазин» (`store/hello`, `store/clock` — Tkinter, so `python` must be on PATH; `store/hello_cs`
+— WinForms на C#, собирается csc'ом при первом запуске). Everything
 goes through `app.rs::launch_installed_app` (Start-menu `DesktopIntent::LaunchApp`, the
 «Все приложения» list, the «Запустить» button); `open_target` falls back to an app lookup, so
 `start hello` works from the terminal too. The «Приложения» window (`WindowId::Apps`, 540×460)
 is the one place that both installs and launches.
+
+### C#-приложения и C#-мост запуска (added 2026-10-23)
+
+**Приложения на C#.** `apps::is_cs()` узнаёт вход `.cs`/`.csproj`; такой запуск идёт не через
+`apps::launch_app`, а запросом `Request::RunCsApp { dir, entry }` в ядро (секунды — кадр не
+держим): ядро компилирует и стартует отдельным процессом, отвечает PID строкой; клиент держит
+`bg_tasks` и пишет итог токеном в чат. Все три точки запуска («Пуск»/«Все приложения», окно
+«Приложения», `start <id>`) сходятся в `app.rs::launch_app_soft` — свободной функции, её
+нельзя сделать методом: окно «Приложения» зовёт её **изнутри замыкания**, где по методу
+потребовался бы весь `&mut self` вместе с уже занятым `self.windows.apps` (тот же приём, что
+`fs_*`). Возвращает `AppLaunch::Pid` либо `Pending` — «собираю» уже в чате, PID придёт токеном.
+
+Компиляция по расширению (`core.rs::cs_build_and_run`):
+
+| вход | чем | результат |
+|---|---|---|
+| `main.cs` | `csc.exe` .NET Framework (C# 5, есть на каждой Windows) | `%TEMP%\vanguard_cs_<папка>_<имя>.exe` — **не** рядом с исходником, иначе мусор в под git-трекинговом `store/` |
+| `app.csproj` | `dotnet build -c Release` (нужен SDK в PATH) | `bin/Release/<TFM>/<имя>.exe`, находится glob'ом по имени проекта |
+
+`dir` приходит относительным (`apps/<id>`): ядро резолвит его от своего CWD (общее правило
+про два процесса); `..` и байты NUL отсекаются текстом, `entry` — только голый файл.
+
+Три палки, проверенные руками 2026-10-23:
+
+- **csc режет аргумент по `/`**: аргумент `tools/vlaunch.cs` он читает как неизвестную опцию
+  `/vlaunch.cs` и ищет `vlaunch.cs` в корне. Всё, что уходит csc'у, — только через
+  `Path::join` (в ядре `dir` к тому же нормализуется заменой `/`→`\`);
+- **`Command::new` с голым именем exe не ищет в CWD**: Rust std снял текущий каталог из
+  резолва exe ради безопасности — `launcher::ensure_helper` возвращает **абсолютный** путь,
+  иначе при лежащем рядом файле приходит io-error «program not found»;
+- **csc пишет диагностику в pipe OEM-кодовой страницей (cp866)**: CS-коды, пути и номера
+  строк читаются, русские фразы компилятора приходят мусором. `encoding_rs` в дереве
+  зависимостей нет, деп ради косметики не тянем — `output_tail` помечает это в док-строке.
+
+`/codepage:65001` обязателен и в сборке хелпера, и в `csc_build`: без BOM UTF-8 читается как
+cp1251 — та же ловушка, что у `.ps1` в PS 5.1. Флаг цели подбирается по исходнику: строка
+`System.Windows.Forms` ⇒ `/target:winexe`, иначе `/target:exe` (иначе WinForms-окну
+приложилась бы пустая консоль). Пример — `store/hello_cs` (иконка ▣): окно WinForms с
+русским текстом, C# 5, SDK не нужен.
+
+**C#-мост запуска** (`tools/vlaunch.cs` → `vanguard_launch.exe`; исходник **ASCII-only** — та
+же дисциплина, что у `tools/*.ps1`; exe в `.gitignore`): ShellExecute, который здесь без
+winapi-зависимостей не сделать — `runas` (UAC-диалог подтверждает сам пользователь), `aumid`
+(`shell:AppsFolder\<AUMID>` — Калькулятор, `ms-settings:…`), `clsid` (`shell::{GUID}`), `shell`
+(обычный запуск). Хелпер собирается csc'ом на месте при первом вызове и пересобирается, когда
+исходник новее по mtime. Поверх:
+
+- `Request::ShellExec { mode, target }` — белый список режимов в ядре (`shell_exec`), ответ —
+  `pid=…` хелпера или хвост ошибки. Терминальный `runas <exe>` (`ShellAction::Elevate`) идёт
+  фоном через этот же запрос (`app.rs::shell_exec_bg`: `bg_tasks` + токен — на UAC ответ может
+  ждать минутами). Если `runas` дошёл до ядра по `Request::Shell`, ядро выполняет его само —
+  обхода через оболочку не требуется;
+- `start aumid:<AUMID>` / `start clsid:<GUID>` — те же префиксы прямо в `open_target`;
+- окно «Файлы»: кнопка «▲ Админ» для exe/bat/cmd/ps1/py (аналог «ПКМ → Запуск от имени
+  администратора»); ответ попадает в статус окна через `FsKind::Status`/`FsReply::Status` —
+  без перечитывания списка.
+
+AI-генерацию C# **не добавляли**: `CreateScript` по-прежнему python/rust/bash, четвёртый
+`action_type` — лишний риск для протокола (см. предупреждение про `generate_system_prompt`).
+`apps/` по-прежнему наполняется руками или извне.
 
 ### Device Manager + virtual drivers («Устройства», `WindowId::Devices`)
 

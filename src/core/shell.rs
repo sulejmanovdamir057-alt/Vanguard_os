@@ -259,6 +259,9 @@ pub enum ShellAction {
     /// `start <цель>`: открыть URL/файл/папку средствами системы. Разбор тут,
     /// запуск — в app.rs: там живёт `sys_open` и будет реестр приложений.
     OpenPath(String),
+    /// `runas <цель>`: запуск с повышением через C#-мост (UAC-диалог системы).
+    /// Разбор тут, IPC (`Request::ShellExec`) — в app.rs, как у OpenPath.
+    Elevate(String),
 }
 
 pub struct VanguardShell {
@@ -316,7 +319,7 @@ impl VanguardShell {
         };
         let action = match cmd.as_str() {
             "help" | "?" => ShellAction::DisplayOutput(String::from(
-                ">> ТЕРМИНАЛ: help, dir [путь], cd [путь], type <файл>, cls, echo <текст>, start <цель>\n\
+                ">> ТЕРМИНАЛ: help, dir [путь], cd [путь], type <файл>, cls, echo <текст>, start <цель>, runas <exe>\n\
                  >> СИСТЕМА: ipconfig, tasklist, systeminfo, ver, whoami, hostname\n\
                  >> ЯДРО: /help, /apps, /run <id>, /hardware, /wipe, /reset, /exit\n",
             )),
@@ -343,6 +346,15 @@ impl VanguardShell {
                     ))
                 } else {
                     ShellAction::OpenPath(arg)
+                }
+            }
+            "runas" => {
+                if arg.is_empty() {
+                    ShellAction::DisplayOutput(String::from(
+                        "vsh: запуск с повышением: runas <exe>\n",
+                    ))
+                } else {
+                    ShellAction::Elevate(arg)
                 }
             }
             "ipconfig" | "tasklist" | "systeminfo" | "ver" | "whoami" | "hostname" => {
